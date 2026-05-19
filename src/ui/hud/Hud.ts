@@ -1,4 +1,4 @@
-import { REWARDS } from "../../game/content/rewards";
+import { REWARDS, rarityLabels } from "../../game/content/rewards";
 import { ADVENTURE_STAGES } from "../../game/content/adventure";
 import { CHARACTERS, getCharacter, getSkillsForCharacter, gradeLabels, type SkillDefinition, SKILLS } from "../../game/content/skills";
 import type { SkillSlot } from "../../game/input/actions";
@@ -12,7 +12,7 @@ import {
   type ProgressionStore,
   type ProgressSnapshot
 } from "../../game/progression/progression";
-import type { GameState, CastGrade, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, GameMode } from "../../game/simulation/types";
+import type { GameState, CastGrade, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, GameMode, BossChallengeState } from "../../game/simulation/types";
 import type { PoseStatus } from "../../game/pose/PoseService";
 
 interface HudOptions {
@@ -53,6 +53,8 @@ export class Hud {
   private readonly overdriveText: HTMLElement;
   private readonly gaugeText: HTMLElement;
   private readonly adventureBanner: HTMLElement;
+  private readonly bossChallengePrompt: HTMLElement;
+  private readonly trainingPanel: HTMLElement;
   private readonly castPrompt: HTMLElement;
   private readonly toast: HTMLElement;
   private readonly cameraPanel: HTMLElement;
@@ -62,9 +64,7 @@ export class Hud {
   private readonly cameraButton: HTMLButtonElement;
   private readonly rewardsOverlay: HTMLElement;
   private readonly modalOverlay: HTMLElement;
-  private readonly modalTitle: HTMLElement;
-  private readonly modalText: HTMLElement;
-  private readonly restartButton: HTMLButtonElement;
+  private readonly modalPanel: HTMLElement;
   private readonly hubOverlay: HTMLElement;
   private readonly hubButton: HTMLButtonElement;
   private readonly characterSwitch: HTMLElement;
@@ -175,25 +175,30 @@ export class Hud {
     camera.appendChild(this.cameraButton);
 
     this.adventureBanner = div("adventure-banner");
+    this.bossChallengePrompt = div("boss-challenge-prompt");
+    this.trainingPanel = div("training-panel");
     this.castPrompt = div("cast-prompt");
     this.toast = div("toast");
     this.hubOverlay = div("hub-overlay");
     this.rewardsOverlay = div("reward-overlay");
     this.modalOverlay = div("modal-overlay");
-    this.modalOverlay.innerHTML = `
-      <div class="modal-panel">
-        <h1 class="modal-title"></h1>
-        <p class="modal-text"></p>
-      </div>
-    `;
-    this.restartButton = document.createElement("button");
-    this.restartButton.type = "button";
-    this.restartButton.className = "restart-button";
-    this.restartButton.textContent = "다시 도전";
-    this.restartButton.addEventListener("click", () => this.options.onRestart());
-    this.modalOverlay.querySelector(".modal-panel")?.appendChild(this.restartButton);
+    this.modalPanel = div("modal-panel");
+    this.modalOverlay.appendChild(this.modalPanel);
 
-    this.root.append(topLeft, topRight, skillDock, camera, this.adventureBanner, this.castPrompt, this.toast, this.hubOverlay, this.rewardsOverlay, this.modalOverlay);
+    this.root.append(
+      topLeft,
+      topRight,
+      skillDock,
+      camera,
+      this.adventureBanner,
+      this.bossChallengePrompt,
+      this.trainingPanel,
+      this.castPrompt,
+      this.toast,
+      this.hubOverlay,
+      this.rewardsOverlay,
+      this.modalOverlay
+    );
 
     this.hpFill = topLeft.querySelector(".hp-fill") as HTMLElement;
     this.shieldFill = topLeft.querySelector(".shield-fill") as HTMLElement;
@@ -211,8 +216,6 @@ export class Hud {
     this.cameraPreviewHost = camera.querySelector(".camera-preview-wrap") as HTMLElement;
     this.cameraFxLayer = camera.querySelector(".camera-fx-layer") as HTMLElement;
     this.cameraStatus = camera.querySelector(".camera-status") as HTMLElement;
-    this.modalTitle = this.modalOverlay.querySelector(".modal-title") as HTMLElement;
-    this.modalText = this.modalOverlay.querySelector(".modal-text") as HTMLElement;
     this.characterSwitch = topLeft.querySelector(".character-switch") as HTMLElement;
     this.modeSwitch = topRight.querySelector(".mode-switch") as HTMLElement;
     this.hubButton = document.createElement("button");
@@ -298,6 +301,7 @@ export class Hud {
     this.brandTitle.textContent = character.title;
     this.root.style.setProperty("--active-character", character.uiColor);
     this.root.dataset.character = state.characterId;
+    this.root.dataset.mode = state.mode;
     this.root.querySelectorAll<HTMLButtonElement>(".character-button").forEach((button) => {
       button.classList.toggle("is-active", button.textContent === character.name);
     });
@@ -363,6 +367,8 @@ export class Hud {
     this.renderRewards(state);
     this.renderModal(state);
     this.renderAdventureBanner(state);
+    this.renderBossChallenge(state);
+    this.renderTrainingPanel(state);
     this.renderHub();
     this.tickToast();
   }
@@ -397,6 +403,36 @@ export class Hud {
     window.setTimeout(() => {
       this.castPrompt.className = "cast-prompt";
     }, 720);
+  }
+
+  showBossChallengeCapture(challenge: BossChallengeState): void {
+    const color =
+      challenge.bossType === "drum"
+        ? "#ffd166"
+        : challenge.bossType === "mirror"
+          ? "#48f7ff"
+          : "#c7b8ff";
+    this.cameraPanel.style.setProperty("--camera-fx-color", color);
+    this.cameraFxLayer.querySelector("i")!.textContent = "BOSS";
+    this.cameraPanel.classList.remove("grade-normal", "grade-great", "grade-perfect");
+    this.cameraPanel.classList.add("is-capturing", "boss-capture");
+  }
+
+  showBossChallengeResult(grade: CastGrade, line: string): void {
+    this.cameraPanel.classList.remove("is-capturing", "boss-capture", "grade-normal", "grade-great", "grade-perfect");
+    if (grade !== "Miss") {
+      this.cameraPanel.classList.add(`grade-${grade.toLowerCase()}`);
+    }
+    this.castPrompt.innerHTML = `
+      <strong>${grade === "Miss" ? "BREAK FAIL" : `${gradeLabels[grade]} COUNTER`}</strong>
+      <span>${line}</span>
+    `;
+    this.castPrompt.style.setProperty("--prompt-color", grade === "Perfect" ? "#ffd166" : "#48f7ff");
+    this.castPrompt.classList.add("is-visible", `grade-${grade.toLowerCase()}`);
+    window.setTimeout(() => {
+      this.cameraPanel.classList.remove("grade-normal", "grade-great", "grade-perfect");
+      this.castPrompt.className = "cast-prompt";
+    }, 900);
   }
 
   showToast(text: string): void {
@@ -455,6 +491,87 @@ export class Hud {
       </div>
       <p>${state.adventureStageGoal}</p>
       <div class="adventure-progress"><i style="width:${progress}%"></i></div>
+    `;
+  }
+
+  private renderBossChallenge(state: GameState): void {
+    const challenge = state.bossChallenge;
+    if (!challenge || state.victory || state.gameOver) {
+      this.bossChallengePrompt.classList.remove("is-visible");
+      this.bossChallengePrompt.innerHTML = "";
+      return;
+    }
+
+    const remaining = Math.max(0, challenge.expiresAt - state.time);
+    const progress = Math.max(0, Math.min(100, (remaining / 2.45) * 100));
+    const bossLabel =
+      challenge.bossType === "drum" ? "DRUM NOISE" : challenge.bossType === "mirror" ? "MIRROR WITCH" : "ZERO MOTION";
+    this.bossChallengePrompt.dataset.boss = challenge.bossType;
+    this.bossChallengePrompt.classList.add("is-visible");
+    this.bossChallengePrompt.innerHTML = `
+      <div class="boss-challenge-kicker">BOSS POSE BREAK</div>
+      <strong>${bossLabel}</strong>
+      <span>${challenge.prompt}</span>
+      <p>${gestureLabel(challenge.requiredGesture)} · 1/2/3 테스트</p>
+      <div class="boss-challenge-timer"><i style="width:${progress}%"></i></div>
+    `;
+  }
+
+  private renderTrainingPanel(state: GameState): void {
+    if (state.mode !== "training") {
+      this.trainingPanel.classList.remove("is-visible");
+      this.trainingPanel.innerHTML = "";
+      return;
+    }
+
+    const training = state.training;
+    const totalAttempts = training.missions.reduce((sum, mission) => sum + mission.attempts, 0);
+    const totalPerfects = training.missions.reduce((sum, mission) => sum + mission.perfects, 0);
+    const totalCompleted = training.missions.filter((mission) => mission.completed).length;
+    const perfectRate = totalAttempts > 0 ? Math.round((totalPerfects / totalAttempts) * 100) : 0;
+    const last = training.lastResult;
+    const missionRows = training.missions
+      .map((mission) => {
+        const progress = Math.min(100, (mission.successes / mission.targetSuccesses) * 100);
+        const missionPerfectRate = mission.attempts > 0 ? Math.round((mission.perfects / mission.attempts) * 100) : 0;
+        return `
+          <div class="training-mission ${mission.completed ? "is-complete" : ""}">
+            <div>
+              <strong>${mission.title}</strong>
+              <span>${gestureLabel(mission.gestureId)} · ${mission.successes}/${mission.targetSuccesses}</span>
+            </div>
+            <p>${mission.prompt}</p>
+            <div class="training-progress"><i style="width:${progress}%"></i></div>
+            <small>${mission.completed ? "완료" : `Perfect ${missionPerfectRate}%`}</small>
+          </div>
+        `;
+      })
+      .join("");
+
+    this.trainingPanel.classList.add("is-visible");
+    this.trainingPanel.innerHTML = `
+      <div class="training-header">
+        <div>
+          <p>POSE TRAINING</p>
+          <strong>훈련장 미션</strong>
+        </div>
+        <span>${totalCompleted}/${training.missions.length} 완료</span>
+      </div>
+      <div class="training-summary">
+        <div><span>Perfect 성공률</span><strong>${perfectRate}%</strong></div>
+        <div><span>최근 점수</span><strong>${last ? Math.round(last.score) : "--"}</strong></div>
+        <div><span>최근 등급</span><strong class="${last ? `grade-${last.grade.toLowerCase()}` : ""}">${last ? gradeLabels[last.grade] : "READY"}</strong></div>
+      </div>
+      <div class="training-last">
+        <b>${last ? gestureLabel(last.gestureId) : "포즈 대기"}</b>
+        <span>${last ? last.reason : "스킬 버튼을 누른 뒤 포즈를 취하거나, 1/2/3으로 다음 미션을 테스트하세요."}</span>
+      </div>
+      <div class="training-camera-guide">
+        <strong>카메라 보정 팁</strong>
+        <span>상반신, 양어깨, 양손목이 모두 화면에 들어오게 1m 정도 떨어져 앉으세요. 역광을 피하고 손이 얼굴 밖으로 지나갈 만큼 공간을 확보하세요. 포즈는 스킬 준비 후 약 1.2초 안에 끝내면 가장 안정적입니다.</span>
+      </div>
+      <div class="training-mission-list">${missionRows}</div>
+      <div class="training-unlock-note">완료 키: ${training.completedRewardKeys.length > 0 ? training.completedRewardKeys.join(" / ") : "아직 없음"}</div>
     `;
   }
 
@@ -750,8 +867,13 @@ export class Hud {
       }
       const button = document.createElement("button");
       button.type = "button";
-      button.className = "reward-card";
-      button.innerHTML = `<strong>${reward.title}</strong><span>${reward.description}</span>`;
+      button.className = `reward-card rarity-${reward.rarity}`;
+      button.innerHTML = `
+        <i class="reward-rarity">${rarityLabels[reward.rarity]}</i>
+        <strong>${reward.title}</strong>
+        <span>${reward.description}</span>
+        <small>${reward.characterId ? `${getCharacter(reward.characterId).name} 전용` : "공용"} · ${reward.tags.join(" / ")}</small>
+      `;
       button.addEventListener("click", () => this.options.onRewardSelected(reward.id));
       cards.appendChild(button);
     }
@@ -767,31 +889,132 @@ export class Hud {
       return;
     }
 
-    const key = `${state.paused}:${state.gameOver}:${state.victory}`;
+    const stats = state.runStats;
+    const key = [
+      state.paused,
+      state.gameOver,
+      state.victory,
+      state.mode,
+      state.characterId,
+      Math.floor(state.modeTime),
+      state.player.score,
+      stats.kills,
+      stats.perfectCasts,
+      stats.greatCasts,
+      stats.normalCasts,
+      stats.misses,
+      stats.maxPerfectCombo,
+      stats.damageTaken,
+      stats.skillsUsed,
+      stats.xpGained,
+      stats.unlockedItems.map((item) => item.id).join(","),
+      stats.rewardsChosen.join(",")
+    ].join(":");
     if (key === this.modalKey) {
       return;
     }
     this.modalKey = key;
 
-    if (state.victory) {
-      this.modalTitle.textContent =
-        state.mode === "adventure" ? "Adventure Complete" : state.mode === "boss-rush" ? "Boss Rush Cleared" : "Loop City Cleared";
-      this.modalText.textContent =
-        state.mode === "adventure"
-          ? `${getCharacter(state.characterId).name}이 모든 아케이드 스테이지를 돌파했습니다.`
-          : `${getCharacter(state.characterId).name}의 움직임이 노이즈를 정화했습니다.`;
+    if (state.victory || state.gameOver) {
+      this.modalPanel.className = "modal-panel result-panel";
+      const character = getCharacter(state.characterId);
+      const nextStage = state.mode === "adventure" ? ADVENTURE_STAGES[state.adventureStageIndex + 1] : undefined;
+      const rewardItems =
+        stats.rewardsChosen.length > 0
+          ? stats.rewardsChosen
+              .map((rewardId) => REWARDS.find((reward) => reward.id === rewardId))
+              .filter((reward): reward is NonNullable<typeof reward> => Boolean(reward))
+              .map((reward) => `<li class="rarity-${reward.rarity}"><i>${rarityLabels[reward.rarity]}</i><span>${reward.title}</span></li>`)
+              .join("")
+          : `<li class="empty-result-reward"><span>선택한 보상 없음</span></li>`;
+      const levelText =
+        stats.levelAfter > stats.levelBefore
+          ? `LV ${stats.levelBefore} → ${stats.levelAfter}`
+          : `LV ${stats.levelAfter}`;
+      const unlockItems =
+        stats.unlockedItems.length > 0
+          ? stats.unlockedItems
+              .map(
+                (item) => `
+                  <li>
+                    <i>${unlockTypeLabel(item.type)}</i>
+                    <div>
+                      <strong>${item.title}</strong>
+                      <span>${item.description}</span>
+                    </div>
+                  </li>
+                `
+              )
+              .join("")
+          : `<li class="empty-unlock"><div><strong>새 해금 없음</strong><span>다음 판에서 조건을 노려보세요.</span></div></li>`;
+
+      this.modalPanel.innerHTML = `
+        <div class="result-header">
+          <p>${state.victory ? "RUN CLEAR" : "RUN FAILED"}</p>
+          <h1>${state.victory ? "Pose Break Result" : "Noise Overwhelmed"}</h1>
+          <span>${character.name} · ${modeLabel(state.mode)} · ${state.stageName}</span>
+        </div>
+        <div class="result-summary-grid">
+          ${resultStat("생존 시간", formatDuration(state.modeTime || state.time))}
+          ${resultStat("점수", state.player.score.toLocaleString())}
+          ${resultStat("처치 수", stats.kills.toLocaleString())}
+          ${resultStat("획득 XP", `+${stats.xpGained.toLocaleString()}`)}
+          ${resultStat("레벨", levelText)}
+          ${resultStat("받은 피해", stats.damageTaken.toLocaleString())}
+        </div>
+        <div class="result-body-grid">
+          <section class="result-section">
+            <strong>Cast Grade</strong>
+            <div class="cast-grade-grid">
+              ${resultGrade("Perfect", stats.perfectCasts)}
+              ${resultGrade("Great", stats.greatCasts)}
+              ${resultGrade("Normal", stats.normalCasts)}
+              ${resultGrade("Miss", stats.misses)}
+            </div>
+            <div class="result-combo-line">
+              <span>최고 Perfect 콤보</span>
+              <b>x${stats.maxPerfectCombo}</b>
+            </div>
+            <div class="result-combo-line">
+              <span>스킬 사용</span>
+              <b>${stats.skillsUsed}</b>
+            </div>
+          </section>
+          <section class="result-section">
+            <strong>Chosen Rewards</strong>
+            <ul class="result-reward-list">${rewardItems}</ul>
+          </section>
+          <section class="result-section result-unlock-section">
+            <strong>New Unlocks</strong>
+            <ul class="result-unlock-list">${unlockItems}</ul>
+          </section>
+        </div>
+        <div class="result-actions">
+          <button class="result-button primary result-retry" type="button">다시 도전</button>
+          <button class="result-button result-hub" type="button">허브 열기</button>
+          <button class="result-button result-training" type="button">훈련장</button>
+          <button class="result-button result-next-adventure" type="button" ${nextStage ? "" : "disabled"}>
+            ${nextStage ? `다음 모험 스테이지` : "다음 모험 스테이지 없음"}
+          </button>
+        </div>
+      `;
+
       this.modalOverlay.classList.add("is-visible");
-      this.restartButton.style.display = "inline-flex";
-    } else if (state.gameOver) {
-      this.modalTitle.textContent = "Pose Break Failed";
-      this.modalText.textContent = "노이즈가 움직임을 잠식했습니다.";
-      this.modalOverlay.classList.add("is-visible");
-      this.restartButton.style.display = "inline-flex";
+      this.modalPanel.querySelector<HTMLButtonElement>(".result-retry")?.addEventListener("click", () => this.options.onRestart());
+      this.modalPanel.querySelector<HTMLButtonElement>(".result-hub")?.addEventListener("click", () => this.toggleHub(true));
+      this.modalPanel.querySelector<HTMLButtonElement>(".result-training")?.addEventListener("click", () => this.options.onModeSelected("training"));
+      this.modalPanel.querySelector<HTMLButtonElement>(".result-next-adventure")?.addEventListener("click", () => {
+        if (nextStage) {
+          this.options.onAdventureStageSelected(nextStage.id);
+        }
+      });
     } else if (state.paused) {
-      this.modalTitle.textContent = "Paused";
-      this.modalText.textContent = "숨을 고르고 다시 움직일 시간입니다.";
+      this.modalPanel.className = "modal-panel";
+      this.modalPanel.innerHTML = `
+        <h1 class="modal-title">Paused</h1>
+        <p class="modal-text">숨을 고르고 다시 움직일 시간입니다.</p>
+      `;
       this.modalOverlay.classList.add("is-visible");
-      this.restartButton.style.display = "none";
     } else {
       this.modalOverlay.classList.remove("is-visible");
     }
@@ -802,4 +1025,70 @@ function div(className: string): HTMLElement {
   const element = document.createElement("div");
   element.className = className;
   return element;
+}
+
+function resultStat(label: string, value: string): string {
+  return `
+    <div class="result-stat">
+      <span>${label}</span>
+      <strong>${value}</strong>
+    </div>
+  `;
+}
+
+function resultGrade(label: CastGrade, value: number): string {
+  return `
+    <div class="result-grade grade-${label.toLowerCase()}">
+      <span>${label}</span>
+      <strong>${value}</strong>
+    </div>
+  `;
+}
+
+function formatDuration(seconds: number): string {
+  const total = Math.max(0, Math.floor(seconds));
+  const minutesText = Math.floor(total / 60)
+    .toString()
+    .padStart(2, "0");
+  const secondsText = (total % 60).toString().padStart(2, "0");
+  return `${minutesText}:${secondsText}`;
+}
+
+function modeLabel(mode: GameMode): string {
+  const labels: Record<GameMode, string> = {
+    story: "전투",
+    adventure: "모험",
+    survival: "생존",
+    "boss-rush": "보스 러시",
+    training: "훈련장"
+  };
+  return labels[mode];
+}
+
+function unlockTypeLabel(type: "core" | "skin" | "effect"): string {
+  const labels: Record<"core" | "skin" | "effect", string> = {
+    core: "CORE",
+    skin: "SKIN",
+    effect: "FX"
+  };
+  return labels[type];
+}
+
+function gestureLabel(gesture: BossChallengeState["requiredGesture"]): string {
+  const labels: Record<BossChallengeState["requiredGesture"], string> = {
+    slash: "슬래시",
+    thrust: "팜 스러스트",
+    rise: "라이즈",
+    "open-arms": "오픈 암",
+    "cross-guard": "크로스 가드",
+    "palm-push": "팜 푸시",
+    "ground-slam": "그라운드 슬램",
+    point: "포인트",
+    circle: "서클",
+    wave: "웨이브",
+    spread: "스프레드",
+    heart: "하트",
+    "focus-triangle": "포커스 트라이앵글"
+  };
+  return labels[gesture];
 }

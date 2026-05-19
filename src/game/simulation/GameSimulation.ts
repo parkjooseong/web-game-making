@@ -1,6 +1,7 @@
-import { REWARDS } from "../content/rewards";
+import { REWARDS, getRewardDefinition, type RewardDefinition, type RewardRarity } from "../content/rewards";
 import { ADVENTURE_STAGES } from "../content/adventure";
 import { CHARACTER_ORDER, getCharacter, getSkillsForCharacter } from "../content/skills";
+import { createTrainingState } from "../content/training";
 import type { MoveInput, SkillSlot } from "../input/actions";
 import { getDefaultSkinId } from "../progression/progression";
 import type { ProgressionStore } from "../progression/progression";
@@ -8,6 +9,7 @@ import type {
   CastGrade,
   CastResponse,
   AllyState,
+  BossChallengeState,
   CharacterId,
   EnemyState,
   EnemyType,
@@ -104,6 +106,7 @@ export class GameSimulation {
     state.modeTime += step;
     this.updateTimers(step);
     this.updatePreparedSkillExpiry();
+    this.updateBossChallengeExpiry();
     this.updatePlayer(step, input);
     this.updateSpawning(step);
     this.updateSurvivalFlow();
@@ -124,6 +127,9 @@ export class GameSimulation {
     }
     if (state.preparedSkill) {
       return { ok: false, line: "이미 포즈를 읽는 중입니다." };
+    }
+    if (state.bossChallenge) {
+      return { ok: false, line: "보스 포즈 브레이크가 우선입니다." };
     }
     if (state.cooldowns[slot] > 0) {
       return { ok: false, line: `${skill.name} 쿨타임 ${state.cooldowns[slot].toFixed(1)}초` };
@@ -151,9 +157,20 @@ export class GameSimulation {
 
     const skill = this.getCurrentSkills()[prepared.slot];
     state.preparedSkill = null;
+    state.runStats.skillsUsed += 1;
+    this.recordTrainingGestureResult(result);
+    if (result.grade === "Perfect") {
+      state.runStats.perfectCasts += 1;
+    } else if (result.grade === "Great") {
+      state.runStats.greatCasts += 1;
+    } else if (result.grade === "Normal") {
+      state.runStats.normalCasts += 1;
+    } else {
+      state.runStats.misses += 1;
+    }
 
     if (result.grade === "Miss") {
-      state.cooldowns[prepared.slot] = skill.cooldown * (state.activeCoreId === "stability-core" ? 0.16 : 0.3);
+      state.cooldowns[prepared.slot] = skill.cooldown * (state.activeCoreId === "stability-core" ? 0.16 : 0.3) * state.upgrades.missCooldownMultiplier;
       state.player.comboPerfect = 0;
       state.player.sameSkillChain = 0;
       this.progression?.recordCast(state.characterId, skill.id, result.grade);
@@ -169,13 +186,14 @@ export class GameSimulation {
       return { ok: true, line: state.message };
     }
 
-    state.cooldowns[prepared.slot] = skill.cooldown * (state.dailyChallengeId === "unstable-core" ? 1.15 : 1);
+    state.cooldowns[prepared.slot] = skill.cooldown * (state.dailyChallengeId === "unstable-core" ? 1.15 : 1) * state.upgrades.cooldownMultiplier;
     state.player.gauge = clamp(state.player.gauge - skill.gaugeCost, 0, state.player.maxGauge);
     state.player.sameSkillChain = state.player.lastSkillId === skill.id ? Math.min(5, state.player.sameSkillChain + 1) : 1;
     state.player.lastSkillId = skill.id;
 
     if (result.grade === "Perfect") {
       state.player.comboPerfect += 1;
+      state.runStats.maxPerfectCombo = Math.max(state.runStats.maxPerfectCombo, state.player.comboPerfect);
       state.cooldowns[prepared.slot] *= 1 - state.upgrades.perfectCooldownRefund;
       if (state.activeCoreId === "rhythm-core") {
         state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
@@ -183,6 +201,9 @@ export class GameSimulation {
       }
       if (state.dailyChallengeId === "perfect-surge") {
         state.player.gauge = clamp(state.player.gauge + 12, 0, state.player.maxGauge);
+      }
+      if (state.upgrades.perfectGaugeBonus > 0) {
+        state.player.gauge = clamp(state.player.gauge + state.upgrades.perfectGaugeBonus, 0, state.player.maxGauge);
       }
       this.applyPerfectComboBonus();
     } else {
@@ -230,8 +251,22 @@ export class GameSimulation {
   }
 
   castDebugGrade(grade: Exclude<CastGrade, "Miss">): CastResponse {
+    if (this.state.bossChallenge) {
+      const challenge = this.state.bossChallenge;
+      return this.castBossChallenge({
+        gestureId: challenge.requiredGesture,
+        score: grade === "Perfect" ? 96 : grade === "Great" ? 82 : 58,
+        grade,
+        confidence: 1,
+        reason: "debug input"
+      });
+    }
+
     const prepared = this.state.preparedSkill;
     if (!prepared) {
+      if (this.state.mode === "training") {
+        return this.castTrainingDebugGrade(grade);
+      }
       return { ok: false, line: "준비된 스킬이 없습니다." };
     }
 
@@ -244,6 +279,97 @@ export class GameSimulation {
     });
   }
 
+  castBossChallenge(result: GestureResult): CastResponse {
+    const challenge = this.state.bossChallenge;
+    if (!challenge) {
+      return { ok: false, line: "진행 중인 보스 포즈 브레이크가 없습니다." };
+    }
+
+    this.state.bossChallenge = null;
+    const grade: CastGrade = result.gestureId === challenge.requiredGesture ? result.grade : "Miss";
+    if (grade === "Miss") {
+      return this.failBossChallenge(challenge);
+    }
+
+    return this.succeedBossChallenge(challenge, grade);
+  }
+
+  private castTrainingDebugGrade(grade: Exclude<CastGrade, "Miss">): CastResponse {
+    const gestureId = this.getNextTrainingGesture();
+    const result: GestureResult = {
+      gestureId,
+      score: grade === "Perfect" ? 96 : grade === "Great" ? 82 : 58,
+      grade,
+      confidence: 1,
+      reason: "debug input"
+    };
+    this.recordTrainingGestureResult(result);
+    this.state.runStats.skillsUsed += 1;
+    this.state.runStats[grade === "Perfect" ? "perfectCasts" : grade === "Great" ? "greatCasts" : "normalCasts"] += 1;
+    if (grade === "Perfect") {
+      this.state.player.comboPerfect += 1;
+      this.state.runStats.maxPerfectCombo = Math.max(this.state.runStats.maxPerfectCombo, this.state.player.comboPerfect);
+    } else {
+      this.state.player.comboPerfect = 0;
+    }
+    this.state.message = `훈련 ${gestureId} ${grade}`;
+    this.fxEvents.push({
+      kind: "float-text",
+      x: this.state.player.x,
+      y: this.state.player.y - 86,
+      text: grade,
+      color: grade === "Perfect" ? 0xffd166 : grade === "Great" ? 0xb8ff5c : 0x48f7ff
+    });
+    this.fxEvents.push({ kind: "sound", sound: grade === "Perfect" ? "perfect" : grade === "Great" ? "great" : "normal", grade });
+    return { ok: true, line: this.state.message };
+  }
+
+  private getNextTrainingGesture(): GestureResult["gestureId"] {
+    return this.state.training.missions.find((mission) => !mission.completed)?.gestureId ?? this.state.training.missions[0]?.gestureId ?? "slash";
+  }
+
+  private recordTrainingGestureResult(result: GestureResult): void {
+    const state = this.state;
+    if (state.mode !== "training") {
+      return;
+    }
+
+    state.training.lastResult = {
+      gestureId: result.gestureId,
+      score: result.score,
+      grade: result.grade,
+      reason: result.reason,
+      at: state.time
+    };
+
+    const mission = state.training.missions.find((item) => item.gestureId === result.gestureId);
+    if (!mission) {
+      return;
+    }
+
+    const wasCompleted = mission.completed;
+    mission.attempts += 1;
+    if (result.grade === "Perfect") {
+      mission.perfects += 1;
+    }
+    if (result.grade !== "Miss") {
+      mission.successes = Math.min(mission.targetSuccesses, mission.successes + 1);
+      mission.completed = mission.successes >= mission.targetSuccesses;
+    }
+
+    if (!wasCompleted && mission.completed) {
+      state.training.completedRewardKeys.push(mission.rewardKey);
+      this.fxEvents.push({
+        kind: "float-text",
+        x: state.player.x,
+        y: state.player.y - 126,
+        text: `${mission.title} COMPLETE`,
+        color: 0xffd166
+      });
+      this.fxEvents.push({ kind: "sound", sound: "reward" });
+    }
+  }
+
   chooseReward(rewardId: string): void {
     const state = this.state;
     if (!state.pendingRewardIds.includes(rewardId)) {
@@ -251,6 +377,7 @@ export class GameSimulation {
     }
 
     this.applyReward(rewardId);
+    state.runStats.rewardsChosen.push(rewardId);
     state.pendingRewardIds = [];
     this.continueAfterReward();
   }
@@ -292,7 +419,9 @@ export class GameSimulation {
       spawnQueue: [],
       spawnTimer: 0,
       pendingRewardIds: [],
+      rewardStacks: {},
       preparedSkill: null,
+      bossChallenge: null,
       cooldowns: { Q: 0, E: 0, R: 0, F: 0 },
       player: {
         x: WORLD_WIDTH / 2,
@@ -316,25 +445,104 @@ export class GameSimulation {
         overdriveTime: 0,
         guardCharge: 0,
         shieldWallTime: 0,
+        controlReverseTime: 0,
+        movementSlowTime: 0,
+        infiniteGaugeTime: 0,
         score: 0,
         lastSkillId: null,
         sameSkillChain: 0
       },
+      runStats: {
+        kills: 0,
+        perfectCasts: 0,
+        greatCasts: 0,
+        normalCasts: 0,
+        misses: 0,
+        maxPerfectCombo: 0,
+        damageTaken: 0,
+        skillsUsed: 0,
+        rewardsChosen: [],
+        unlockedItems: [],
+        xpGained: 0,
+        levelBefore: characterLevel,
+        levelAfter: characterLevel
+      },
+      training: createTrainingState(),
       enemies: [],
       projectiles: [],
       traps: [],
       allies: [],
       upgrades: {
+        globalDamageMultiplier: 1,
+        skillDamageMultiplier: 1,
         slashDamageMultiplier: 1,
+        slashRangeMultiplier: 1,
+        slashWidthMultiplier: 1,
+        slashExtraBurstDamageMultiplier: 1,
         perfectCooldownRefund: 0,
+        perfectGaugeBonus: 0,
+        cooldownMultiplier: 1,
+        missCooldownMultiplier: 1,
         dashSkillDamageMultiplier: 1,
+        dashLengthMultiplier: 1,
+        dashStrikeWidthMultiplier: 1,
+        dashHeal: 0,
+        dashGaugeGain: 0,
         gaugeGainMultiplier: 1,
+        scoreMultiplier: 1,
+        areaMultiplier: 1,
+        lowHpDamageBonus: 0,
+        shieldedDamageBonus: 0,
+        sameSkillDamageBonus: 0,
+        swarmDamageBonus: 0,
+        eliteDamageBonus: 0,
         chainExtraTargets: 0,
+        chainDamageMultiplier: 1,
+        chainDecayMultiplier: 0.92,
         basicAttackRateMultiplier: 1,
         basicProjectileSpeedMultiplier: 1,
+        basicDamageMultiplier: 1,
         dashShield: 0,
         overdriveDurationBonus: 0,
-        overdriveDamageMultiplier: 1
+        overdriveDamageMultiplier: 1,
+        overdriveGaugeRefund: 0,
+        guardShieldMultiplier: 1,
+        guardChargeMultiplier: 1,
+        guardHeal: 0,
+        reflectDamageBonus: 0,
+        shieldPushRangeMultiplier: 1,
+        pushKnockbackMultiplier: 1,
+        earthDrumRadiusMultiplier: 1,
+        earthDrumDamageMultiplier: 1,
+        shieldWallRadiusMultiplier: 1,
+        shieldWallDurationBonus: 0,
+        shieldWallReflectBonus: 0,
+        markExtraTargets: 0,
+        markDurationBonus: 0,
+        markDamageMultiplier: 1,
+        markedDamageMultiplier: 1,
+        markedKillGaugeBonus: 0,
+        markedKillCooldownRefund: 0,
+        shadowCutExtraTargets: 0,
+        shadowCutDamageMultiplier: 1,
+        trapRadiusMultiplier: 1,
+        trapDamageMultiplier: 1,
+        trapTtlBonus: 0,
+        blackoutRadiusMultiplier: 1,
+        blackoutSlowBonus: 0,
+        enemySlowOnHitTime: 0,
+        jellyRadiusMultiplier: 1,
+        jellyDamageMultiplier: 1,
+        jellyHealBonus: 0,
+        jellySweetFieldRadius: 0,
+        slimeSummonBonus: 0,
+        slimeDamageMultiplier: 1,
+        slimeTtlBonus: 0,
+        sweetFieldRadiusMultiplier: 1,
+        sweetFieldHealBonus: 0,
+        slimePartyBonus: 0,
+        bigSlimeDamageMultiplier: 1,
+        bigSlimeTtlBonus: 0
       },
       message: "Loop City"
     };
@@ -369,6 +577,12 @@ export class GameSimulation {
     state.player.comboRangeBonusTime = Math.max(0, state.player.comboRangeBonusTime - dt);
     state.player.overdriveTime = Math.max(0, state.player.overdriveTime - dt);
     state.player.shieldWallTime = Math.max(0, state.player.shieldWallTime - dt);
+    state.player.controlReverseTime = Math.max(0, state.player.controlReverseTime - dt);
+    state.player.movementSlowTime = Math.max(0, state.player.movementSlowTime - dt);
+    state.player.infiniteGaugeTime = Math.max(0, state.player.infiniteGaugeTime - dt);
+    if (state.player.infiniteGaugeTime > 0) {
+      state.player.gauge = state.player.maxGauge;
+    }
     if (state.mode === "training") {
       state.player.gauge = state.player.maxGauge;
       state.player.hp = Math.max(state.player.hp, state.player.maxHp);
@@ -396,9 +610,21 @@ export class GameSimulation {
     }
   }
 
+  private updateBossChallengeExpiry(): void {
+    const challenge = this.state.bossChallenge;
+    if (challenge && this.state.time > challenge.expiresAt) {
+      this.state.bossChallenge = null;
+      this.failBossChallenge(challenge);
+    }
+  }
+
   private updatePlayer(dt: number, input: SimulationInput): void {
     const player = this.state.player;
-    const move = normalize(input.move);
+    const rawMove = normalize(input.move);
+    const move =
+      player.controlReverseTime > 0
+        ? { x: -rawMove.x, y: -rawMove.y }
+        : rawMove;
     if (Math.abs(move.x) + Math.abs(move.y) > 0) {
       player.facing = move;
     }
@@ -410,6 +636,15 @@ export class GameSimulation {
       player.dashCooldown = 1.05;
       player.invulnerableTime = 0.24;
       player.dashBuffTime = 2;
+      if (this.state.upgrades.dashShield > 0) {
+        player.shield = Math.max(player.shield, this.state.upgrades.dashShield * 0.45);
+      }
+      if (this.state.upgrades.dashHeal > 0) {
+        player.hp = clamp(player.hp + this.state.upgrades.dashHeal, 0, player.maxHp);
+      }
+      if (this.state.upgrades.dashGaugeGain > 0) {
+        player.gauge = clamp(player.gauge + this.state.upgrades.dashGaugeGain, 0, player.maxGauge);
+      }
       this.fxEvents.push({
         kind: "burst",
         x: player.x,
@@ -421,7 +656,8 @@ export class GameSimulation {
     }
 
     const baseSpeed = getCharacter(this.state.characterId).speed;
-    const speed = player.dashTime > 0 ? 760 : player.overdriveTime > 0 ? baseSpeed + 55 : baseSpeed;
+    const slowMultiplier = player.movementSlowTime > 0 ? 0.52 : 1;
+    const speed = (player.dashTime > 0 ? 760 : player.overdriveTime > 0 ? baseSpeed + 55 : baseSpeed) * slowMultiplier;
     const direction = player.dashTime > 0 ? player.facing : move;
     player.x = clamp(player.x + direction.x * speed * dt, 48, WORLD_WIDTH - 48);
     player.y = clamp(player.y + direction.y * speed * dt, 48, WORLD_HEIGHT - 48);
@@ -521,7 +757,15 @@ export class GameSimulation {
         enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
         if (enemy.pulseCooldown <= 0) {
           this.fireDrumPulse(enemy);
-          enemy.pulseCooldown = randomRange(2.4, 3.1);
+          this.startBossChallenge(enemy, {
+            bossType: "drum",
+            requiredGesture: "cross-guard",
+            prompt: "팔을 X자로 교차해 리듬 반사를 카운터하세요",
+            successEffect: "drum-counter",
+            failDamage: 18,
+            duration: 2.25
+          });
+          enemy.pulseCooldown = randomRange(6.4, 7.6);
         }
       } else if (enemy.type === "mirror") {
         const castingPressure = state.preparedSkill ? 1.6 : 1;
@@ -534,7 +778,15 @@ export class GameSimulation {
         }
         if (enemy.pulseCooldown <= 0) {
           this.spawnMirrorClone(enemy);
-          enemy.pulseCooldown = randomRange(5.6, 7.2);
+          this.startBossChallenge(enemy, {
+            bossType: "mirror",
+            requiredGesture: "slash",
+            prompt: "손을 날카롭게 휘둘러 거울 분신을 깨세요",
+            successEffect: "mirror-shatter",
+            failDamage: 4,
+            duration: 2.05
+          });
+          enemy.pulseCooldown = randomRange(7.2, 8.6);
         }
       } else {
         const desired = dist < 470 ? -0.22 : dist > 660 ? 0.28 : 0;
@@ -545,8 +797,18 @@ export class GameSimulation {
           player.dashCooldown = Math.max(player.dashCooldown, 0.15);
         }
         if (enemy.pulseCooldown <= 0) {
-          this.fireZeroMotionPulse(enemy);
-          enemy.pulseCooldown = randomRange(2.8, 3.7);
+          const challenged = this.startBossChallenge(enemy, {
+            bossType: "zero",
+            requiredGesture: "open-arms",
+            prompt: "양팔을 크게 벌려 제로 모션의 정지장을 깨세요",
+            successEffect: "zero-release",
+            failDamage: 22,
+            duration: 2.45
+          });
+          if (!challenged) {
+            this.fireZeroMotionPulse(enemy);
+          }
+          enemy.pulseCooldown = randomRange(6.7, 8.1);
         }
       }
 
@@ -709,8 +971,8 @@ export class GameSimulation {
       y: player.y + direction.y * 28,
       direction,
       speed: 660 * state.upgrades.basicProjectileSpeedMultiplier,
-      damage: character.basicDamage * this.getGlobalDamageMultiplier(),
-      radius: 7,
+      damage: character.basicDamage * state.upgrades.basicDamageMultiplier * this.getGlobalDamageMultiplier(),
+      radius: 7 + Math.max(0, state.upgrades.basicProjectileSpeedMultiplier - 1) * 6,
       ttl: 1.2,
       color: character.basicColor
     });
@@ -739,6 +1001,7 @@ export class GameSimulation {
     }
 
     state.waveActive = false;
+    state.bossChallenge = null;
     state.projectiles = state.projectiles.filter((projectile) => projectile.owner === "player");
 
     if (state.mode === "adventure") {
@@ -1162,9 +1425,9 @@ export class GameSimulation {
     const skill = this.getCurrentSkills().Q;
     const direction = player.facing;
     const rangeBonus = player.comboRangeBonusTime > 0 ? 1.24 : 1;
-    const range = (grade === "Perfect" ? 780 : grade === "Great" ? 690 : 610) * rangeBonus;
-    const width = (grade === "Perfect" ? 112 : grade === "Great" ? 88 : 70) * rangeBonus;
-    let damage = skill.damageByGrade[grade] * state.upgrades.slashDamageMultiplier * this.getGlobalDamageMultiplier();
+    const range = (grade === "Perfect" ? 780 : grade === "Great" ? 690 : 610) * rangeBonus * state.upgrades.areaMultiplier * state.upgrades.slashRangeMultiplier;
+    const width = (grade === "Perfect" ? 112 : grade === "Great" ? 88 : 70) * rangeBonus * state.upgrades.areaMultiplier * state.upgrades.slashWidthMultiplier;
+    let damage = skill.damageByGrade[grade] * state.upgrades.slashDamageMultiplier * this.getSkillDamageMultiplier();
     if (player.dashBuffTime > 0) {
       damage *= state.upgrades.dashSkillDamageMultiplier;
     }
@@ -1193,7 +1456,7 @@ export class GameSimulation {
     if (grade === "Perfect" && state.upgrades.slashDamageMultiplier > 1 && hits > 0) {
       for (const enemy of [...state.enemies].slice(0, 3)) {
         if (distance(enemy, player) < range + 120) {
-          this.damageEnemy(enemy, damage * 0.35, skill.color);
+          this.damageEnemy(enemy, damage * 0.35 * state.upgrades.slashExtraBurstDamageMultiplier, skill.color);
         }
       }
     }
@@ -1205,8 +1468,9 @@ export class GameSimulation {
     const skill = this.getCurrentSkills().E;
     const direction = player.facing;
     const start = { x: player.x, y: player.y };
-    const length = grade === "Perfect" ? 360 : grade === "Great" ? 310 : 250;
-    let damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const length = (grade === "Perfect" ? 360 : grade === "Great" ? 310 : 250) * state.upgrades.dashLengthMultiplier;
+    const hitWidth = 92 * state.upgrades.areaMultiplier * state.upgrades.dashStrikeWidthMultiplier;
+    let damage = skill.damageByGrade[grade] * this.getSkillDamageMultiplier();
     if (player.dashBuffTime > 0) {
       damage *= state.upgrades.dashSkillDamageMultiplier;
     }
@@ -1221,8 +1485,11 @@ export class GameSimulation {
     for (const enemy of [...state.enemies]) {
       const toEnemy = { x: enemy.x - start.x, y: enemy.y - start.y };
       const forward = dot(toEnemy, direction);
-      if (forward > -30 && forward < length + 60 && perpendicularDistance(enemy, start, direction) < 92) {
+      if (forward > -30 && forward < length + 60 && perpendicularDistance(enemy, start, direction) < hitWidth) {
         this.damageEnemy(enemy, damage, skill.color);
+        if (state.upgrades.dashGaugeGain > 0) {
+          player.gauge = clamp(player.gauge + state.upgrades.dashGaugeGain * 0.5, 0, player.maxGauge);
+        }
       }
     }
 
@@ -1241,7 +1508,7 @@ export class GameSimulation {
     const skill = this.getCurrentSkills().R;
     const comboBonus = player.comboRangeBonusTime > 0 ? 2 : 0;
     const maxTargets = (grade === "Perfect" ? 7 : grade === "Great" ? 5 : 3) + state.upgrades.chainExtraTargets + comboBonus;
-    let damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    let damage = skill.damageByGrade[grade] * state.upgrades.chainDamageMultiplier * this.getSkillDamageMultiplier();
     if (player.dashBuffTime > 0) {
       damage *= state.upgrades.dashSkillDamageMultiplier;
     }
@@ -1264,7 +1531,7 @@ export class GameSimulation {
     for (const target of targets) {
       points.push({ x: target.x, y: target.y });
       this.damageEnemy(target, damage, skill.color);
-      damage *= 0.92;
+      damage *= state.upgrades.chainDecayMultiplier;
     }
 
     this.fxEvents.push({
@@ -1289,12 +1556,15 @@ export class GameSimulation {
     const player = state.player;
     const skill = this.getCurrentSkills().F;
     const duration = (grade === "Perfect" ? 12 : grade === "Great" ? 9.5 : 7) + state.upgrades.overdriveDurationBonus;
-    const radius = grade === "Perfect" ? 620 : grade === "Great" ? 510 : 420;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 620 : grade === "Great" ? 510 : 420) * state.upgrades.areaMultiplier;
+    const damage = skill.damageByGrade[grade] * this.getSkillDamageMultiplier();
 
     player.overdriveTime = Math.max(player.overdriveTime, duration);
     player.invulnerableTime = Math.max(player.invulnerableTime, 0.8);
     player.shield = Math.max(player.shield, grade === "Perfect" ? 36 : 22);
+    if (state.upgrades.overdriveGaugeRefund > 0) {
+      player.gauge = clamp(player.gauge + state.upgrades.overdriveGaugeRefund, 0, player.maxGauge);
+    }
 
     for (const enemy of [...state.enemies]) {
       if (distance(player, enemy) < radius) {
@@ -1324,11 +1594,14 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().Q;
-    const shieldGain = grade === "Perfect" ? 46 : grade === "Great" ? 34 : 24;
-    const radius = grade === "Perfect" ? 220 : grade === "Great" ? 170 : 130;
+    const shieldGain = (grade === "Perfect" ? 46 : grade === "Great" ? 34 : 24) * state.upgrades.guardShieldMultiplier;
+    const radius = (grade === "Perfect" ? 220 : grade === "Great" ? 170 : 130) * state.upgrades.areaMultiplier;
     player.shield = Math.max(player.shield, shieldGain);
-    player.guardCharge = Math.max(player.guardCharge, shieldGain + skill.damageByGrade[grade]);
+    player.guardCharge = Math.max(player.guardCharge, (shieldGain + skill.damageByGrade[grade]) * state.upgrades.guardChargeMultiplier);
     player.invulnerableTime = Math.max(player.invulnerableTime, grade === "Perfect" ? 1 : 0.55);
+    if (state.upgrades.guardHeal > 0) {
+      player.hp = clamp(player.hp + state.upgrades.guardHeal, 0, player.maxHp);
+    }
 
     for (const projectile of state.projectiles) {
       if (projectile.owner === "enemy" && distance(projectile, player) < radius) {
@@ -1336,7 +1609,7 @@ export class GameSimulation {
         projectile.vx *= -1.25;
         projectile.vy *= -1.25;
         projectile.color = skill.color;
-        projectile.damage += grade === "Perfect" ? 18 : 9;
+        projectile.damage += (grade === "Perfect" ? 18 : 9) + state.upgrades.reflectDamageBonus;
       }
     }
 
@@ -1363,17 +1636,18 @@ export class GameSimulation {
     const player = state.player;
     const skill = this.getCurrentSkills().E;
     const direction = player.facing;
-    const range = grade === "Perfect" ? 520 : grade === "Great" ? 440 : 360;
-    const width = grade === "Perfect" ? 145 : grade === "Great" ? 118 : 94;
+    const range = (grade === "Perfect" ? 520 : grade === "Great" ? 440 : 360) * state.upgrades.areaMultiplier * state.upgrades.shieldPushRangeMultiplier;
+    const width = (grade === "Perfect" ? 145 : grade === "Great" ? 118 : 94) * state.upgrades.areaMultiplier;
     const reflected = player.guardCharge * (grade === "Perfect" ? 0.9 : 0.55);
-    const damage = (skill.damageByGrade[grade] + reflected) * this.getGlobalDamageMultiplier();
+    const damage = (skill.damageByGrade[grade] + reflected) * this.getSkillDamageMultiplier();
+    const knockback = (grade === "Perfect" ? 180 : 120) * state.upgrades.pushKnockbackMultiplier;
 
     for (const enemy of [...state.enemies]) {
       const toEnemy = { x: enemy.x - player.x, y: enemy.y - player.y };
       const forward = dot(toEnemy, direction);
       if (forward > -30 && forward < range && perpendicularDistance(enemy, player, direction) < width) {
-        enemy.x = clamp(enemy.x + direction.x * (grade === "Perfect" ? 180 : 120), 28, WORLD_WIDTH - 28);
-        enemy.y = clamp(enemy.y + direction.y * (grade === "Perfect" ? 180 : 120), 28, WORLD_HEIGHT - 28);
+        enemy.x = clamp(enemy.x + direction.x * knockback, 28, WORLD_WIDTH - 28);
+        enemy.y = clamp(enemy.y + direction.y * knockback, 28, WORLD_HEIGHT - 28);
         this.damageEnemy(enemy, damage, skill.color);
       }
     }
@@ -1395,8 +1669,8 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().R;
-    const radius = grade === "Perfect" ? 430 : grade === "Great" ? 345 : 270;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 430 : grade === "Great" ? 345 : 270) * state.upgrades.areaMultiplier * state.upgrades.earthDrumRadiusMultiplier;
+    const damage = skill.damageByGrade[grade] * state.upgrades.earthDrumDamageMultiplier * this.getSkillDamageMultiplier();
 
     for (const enemy of [...state.enemies]) {
       const dist = distance(player, enemy);
@@ -1423,9 +1697,9 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().F;
-    const radius = grade === "Perfect" ? 520 : grade === "Great" ? 430 : 340;
-    const duration = grade === "Perfect" ? 9 : grade === "Great" ? 7 : 5.5;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 520 : grade === "Great" ? 430 : 340) * state.upgrades.areaMultiplier * state.upgrades.shieldWallRadiusMultiplier;
+    const duration = (grade === "Perfect" ? 9 : grade === "Great" ? 7 : 5.5) + state.upgrades.shieldWallDurationBonus;
+    const damage = skill.damageByGrade[grade] * this.getSkillDamageMultiplier();
 
     player.shield = Math.max(player.shield, grade === "Perfect" ? 72 : 50);
     player.shieldWallTime = Math.max(player.shieldWallTime, duration);
@@ -1436,7 +1710,7 @@ export class GameSimulation {
         projectile.owner = "player";
         projectile.vx *= -1.45;
         projectile.vy *= -1.45;
-        projectile.damage += damage;
+        projectile.damage += damage + state.upgrades.reflectDamageBonus + state.upgrades.shieldWallReflectBonus;
         projectile.color = skill.color;
       }
     }
@@ -1469,15 +1743,15 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().Q;
-    const maxTargets = grade === "Perfect" ? 3 : grade === "Great" ? 2 : 1;
+    const maxTargets = (grade === "Perfect" ? 3 : grade === "Great" ? 2 : 1) + state.upgrades.markExtraTargets;
     const targets = [...state.enemies]
       .sort((a, b) => distance(player, a) - distance(player, b))
       .slice(0, maxTargets);
 
     for (const target of targets) {
-      target.markedTime = grade === "Perfect" ? 9 : grade === "Great" ? 7 : 5;
+      target.markedTime = (grade === "Perfect" ? 9 : grade === "Great" ? 7 : 5) + state.upgrades.markDurationBonus;
       target.slowTime = Math.max(target.slowTime, grade === "Perfect" ? 1.2 : 0.7);
-      this.damageEnemy(target, skill.damageByGrade[grade] * this.getGlobalDamageMultiplier(), skill.color);
+      this.damageEnemy(target, skill.damageByGrade[grade] * state.upgrades.markDamageMultiplier * this.getSkillDamageMultiplier(), skill.color);
       this.fxEvents.push({
         kind: "bolt",
         points: [
@@ -1508,15 +1782,15 @@ export class GameSimulation {
     const marked = state.enemies.filter((enemy) => enemy.markedTime > 0);
     const targets =
       marked.length > 0
-        ? marked.slice(0, grade === "Perfect" ? 5 : grade === "Great" ? 3 : 2)
+        ? marked.slice(0, (grade === "Perfect" ? 5 : grade === "Great" ? 3 : 2) + state.upgrades.shadowCutExtraTargets)
         : this.findNearestEnemy(player, 780)
           ? [this.findNearestEnemy(player, 780) as EnemyState]
           : [];
     const start = { x: player.x, y: player.y };
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const damage = skill.damageByGrade[grade] * state.upgrades.shadowCutDamageMultiplier * this.getSkillDamageMultiplier();
 
     for (const target of targets) {
-      const markedBonus = target.markedTime > 0 ? 1.55 : 1;
+      const markedBonus = target.markedTime > 0 ? 1.55 * state.upgrades.markedDamageMultiplier : 1;
       this.damageEnemy(target, damage * markedBonus, skill.color);
       target.markedTime = Math.max(0, target.markedTime - 3);
       target.slowTime = Math.max(target.slowTime, 0.8);
@@ -1551,8 +1825,8 @@ export class GameSimulation {
       x: player.x + player.facing.x * 230,
       y: player.y + player.facing.y * 230
     };
-    const radius = grade === "Perfect" ? 250 : grade === "Great" ? 205 : 165;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 250 : grade === "Great" ? 205 : 165) * state.upgrades.areaMultiplier * state.upgrades.trapRadiusMultiplier;
+    const damage = skill.damageByGrade[grade] * state.upgrades.trapDamageMultiplier * this.getSkillDamageMultiplier();
     const overlapping = state.traps.filter((trap) => trap.kind === "noise-trap" && distance(trap, origin) < radius);
 
     if (overlapping.length > 0) {
@@ -1575,7 +1849,7 @@ export class GameSimulation {
       y: origin.y,
       radius,
       damage,
-      ttl: grade === "Perfect" ? 8 : grade === "Great" ? 6.5 : 5,
+      ttl: (grade === "Perfect" ? 8 : grade === "Great" ? 6.5 : 5) + state.upgrades.trapTtlBonus,
       color: skill.color
     });
   }
@@ -1584,14 +1858,14 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().F;
-    const radius = grade === "Perfect" ? 980 : grade === "Great" ? 820 : 680;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 980 : grade === "Great" ? 820 : 680) * state.upgrades.areaMultiplier * state.upgrades.blackoutRadiusMultiplier;
+    const damage = skill.damageByGrade[grade] * this.getSkillDamageMultiplier();
 
     player.invulnerableTime = Math.max(player.invulnerableTime, grade === "Perfect" ? 1.4 : 0.8);
     for (const enemy of [...state.enemies]) {
       if (distance(player, enemy) < radius) {
         enemy.markedTime = Math.max(enemy.markedTime, grade === "Perfect" ? 10 : 7);
-        enemy.slowTime = Math.max(enemy.slowTime, grade === "Perfect" ? 4.8 : 3.2);
+        enemy.slowTime = Math.max(enemy.slowTime, (grade === "Perfect" ? 4.8 : 3.2) + state.upgrades.blackoutSlowBonus);
         this.damageEnemy(enemy, damage, skill.color);
       }
     }
@@ -1616,8 +1890,8 @@ export class GameSimulation {
       x: player.x + player.facing.x * 320,
       y: player.y + player.facing.y * 320
     };
-    const radius = grade === "Perfect" ? 310 : grade === "Great" ? 245 : 190;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 310 : grade === "Great" ? 245 : 190) * state.upgrades.areaMultiplier * state.upgrades.jellyRadiusMultiplier;
+    const damage = skill.damageByGrade[grade] * state.upgrades.jellyDamageMultiplier * this.getSkillDamageMultiplier();
 
     for (const enemy of [...state.enemies]) {
       if (distance(enemy, origin) < radius + enemy.radius) {
@@ -1627,8 +1901,19 @@ export class GameSimulation {
     }
 
     if (grade === "Perfect") {
-      player.hp = clamp(player.hp + 8, 0, player.maxHp);
+      player.hp = clamp(player.hp + 8 + state.upgrades.jellyHealBonus, 0, player.maxHp);
       player.shield = Math.max(player.shield, 14);
+    }
+    if (state.upgrades.jellySweetFieldRadius > 0) {
+      this.spawnTrap({
+        kind: "sweet-field",
+        x: origin.x,
+        y: origin.y,
+        radius: state.upgrades.jellySweetFieldRadius,
+        damage: 6 * state.upgrades.jellyDamageMultiplier,
+        ttl: 4.5,
+        color: 0x7dffb2
+      });
     }
 
     this.fxEvents.push({ kind: "burst", x: origin.x, y: origin.y, radius, color: skill.color, grade });
@@ -1639,7 +1924,7 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().E;
-    const count = grade === "Perfect" ? 4 : grade === "Great" ? 3 : 2;
+    const count = (grade === "Perfect" ? 4 : grade === "Great" ? 3 : 2) + state.upgrades.slimeSummonBonus;
 
     for (let index = 0; index < count; index += 1) {
       const angle = (Math.PI * 2 * index) / count + randomRange(-0.28, 0.28);
@@ -1648,9 +1933,9 @@ export class GameSimulation {
         x: player.x + Math.cos(angle) * 62,
         y: player.y + Math.sin(angle) * 62,
         radius: 17,
-        ttl: grade === "Perfect" ? 20 : grade === "Great" ? 16 : 12,
+        ttl: (grade === "Perfect" ? 20 : grade === "Great" ? 16 : 12) + state.upgrades.slimeTtlBonus,
         speed: 185,
-        damage: skill.damageByGrade[grade] * this.getGlobalDamageMultiplier(),
+        damage: skill.damageByGrade[grade] * state.upgrades.slimeDamageMultiplier * this.getSkillDamageMultiplier(),
         color: skill.color
       });
     }
@@ -1662,17 +1947,17 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().R;
-    const radius = grade === "Perfect" ? 360 : grade === "Great" ? 300 : 240;
+    const radius = (grade === "Perfect" ? 360 : grade === "Great" ? 300 : 240) * state.upgrades.areaMultiplier * state.upgrades.sweetFieldRadiusMultiplier;
     this.spawnTrap({
       kind: "sweet-field",
       x: player.x,
       y: player.y,
       radius,
-      damage: skill.damageByGrade[grade] * this.getGlobalDamageMultiplier(),
+      damage: skill.damageByGrade[grade] * this.getSkillDamageMultiplier(),
       ttl: grade === "Perfect" ? 9 : grade === "Great" ? 7 : 5.5,
       color: skill.color
     });
-    player.hp = clamp(player.hp + (grade === "Perfect" ? 16 : grade === "Great" ? 10 : 6), 0, player.maxHp);
+    player.hp = clamp(player.hp + (grade === "Perfect" ? 16 : grade === "Great" ? 10 : 6) + state.upgrades.sweetFieldHealBonus, 0, player.maxHp);
     player.shield = Math.max(player.shield, grade === "Perfect" ? 26 : 14);
   }
 
@@ -1680,8 +1965,8 @@ export class GameSimulation {
     const state = this.state;
     const player = state.player;
     const skill = this.getCurrentSkills().F;
-    const radius = grade === "Perfect" ? 620 : grade === "Great" ? 510 : 420;
-    const damage = skill.damageByGrade[grade] * this.getGlobalDamageMultiplier();
+    const radius = (grade === "Perfect" ? 620 : grade === "Great" ? 510 : 420) * state.upgrades.areaMultiplier;
+    const damage = skill.damageByGrade[grade] * this.getSkillDamageMultiplier();
 
     for (const enemy of [...state.enemies]) {
       if (distance(player, enemy) < radius + enemy.radius) {
@@ -1695,13 +1980,13 @@ export class GameSimulation {
       x: player.x + player.facing.x * 90,
       y: player.y + player.facing.y * 90,
       radius: 42,
-      ttl: grade === "Perfect" ? 16 : grade === "Great" ? 12 : 9,
+      ttl: (grade === "Perfect" ? 16 : grade === "Great" ? 12 : 9) + state.upgrades.bigSlimeTtlBonus + state.upgrades.slimeTtlBonus,
       speed: 135,
-      damage: damage * 0.55,
+      damage: damage * 0.55 * state.upgrades.bigSlimeDamageMultiplier * state.upgrades.slimeDamageMultiplier,
       color: skill.color
     });
 
-    const smallCount = grade === "Perfect" ? 5 : grade === "Great" ? 3 : 2;
+    const smallCount = (grade === "Perfect" ? 5 : grade === "Great" ? 3 : 2) + state.upgrades.slimePartyBonus;
     for (let index = 0; index < smallCount; index += 1) {
       const angle = (Math.PI * 2 * index) / smallCount;
       this.spawnAlly({
@@ -1709,9 +1994,9 @@ export class GameSimulation {
         x: player.x + Math.cos(angle) * 92,
         y: player.y + Math.sin(angle) * 92,
         radius: 17,
-        ttl: 14,
+        ttl: 14 + state.upgrades.slimeTtlBonus,
         speed: 195,
-        damage: 18,
+        damage: 18 * state.upgrades.slimeDamageMultiplier,
         color: 0x7dffb2
       });
     }
@@ -1730,7 +2015,7 @@ export class GameSimulation {
   private applyPerfectComboBonus(): void {
     const player = this.state.player;
     if (player.comboPerfect === 2) {
-      player.gauge = clamp(player.gauge + 10 * this.state.upgrades.gaugeGainMultiplier, 0, player.maxGauge);
+      player.gauge = clamp(player.gauge + (10 + this.state.upgrades.perfectGaugeBonus) * this.state.upgrades.gaugeGainMultiplier, 0, player.maxGauge);
       this.fxEvents.push({
         kind: "float-text",
         x: player.x,
@@ -1782,11 +2067,205 @@ export class GameSimulation {
     const player = this.state.player;
     const overdrive = player.overdriveTime > 0 ? 1.28 * this.state.upgrades.overdriveDamageMultiplier : 1;
     const focus = this.state.activeCoreId === "focus-core" ? 1 + Math.max(0, player.sameSkillChain - 1) * 0.11 : 1;
+    const sameSkill = 1 + Math.max(0, player.sameSkillChain - 1) * this.state.upgrades.sameSkillDamageBonus;
+    const lowHp = player.hp / player.maxHp < 0.45 ? 1 + this.state.upgrades.lowHpDamageBonus : 1;
+    const shielded = player.shield > 0 ? 1 + this.state.upgrades.shieldedDamageBonus : 1;
     const rampage =
       this.state.activeCoreId === "rampage-core" && player.hp / player.maxHp < 0.45
         ? 1.35
         : 1;
-    return overdrive * focus * rampage;
+    return this.state.upgrades.globalDamageMultiplier * overdrive * focus * sameSkill * lowHp * shielded * rampage;
+  }
+
+  private getSkillDamageMultiplier(): number {
+    return this.getGlobalDamageMultiplier() * this.state.upgrades.skillDamageMultiplier;
+  }
+
+  private startBossChallenge(
+    enemy: EnemyState,
+    challenge: Omit<BossChallengeState, "expiresAt"> & { duration: number }
+  ): boolean {
+    const state = this.state;
+    if (state.bossChallenge || state.gameOver || state.victory || state.pendingRewardIds.length > 0) {
+      return false;
+    }
+
+    state.preparedSkill = null;
+    state.bossChallenge = {
+      bossType: challenge.bossType,
+      requiredGesture: challenge.requiredGesture,
+      prompt: challenge.prompt,
+      expiresAt: state.time + challenge.duration,
+      successEffect: challenge.successEffect,
+      failDamage: challenge.failDamage
+    };
+    state.message = "Boss Pose Break";
+    this.fxEvents.push({ kind: "sound", sound: "boss" });
+    this.fxEvents.push({ kind: "shake", intensity: 0.01, duration: 170 });
+    this.fxEvents.push({
+      kind: "float-text",
+      x: enemy.x,
+      y: enemy.y - 104,
+      text: "POSE BREAK",
+      color: challenge.bossType === "drum" ? 0xffd166 : challenge.bossType === "mirror" ? 0x48f7ff : 0xc7b8ff
+    });
+    return true;
+  }
+
+  private succeedBossChallenge(challenge: BossChallengeState, grade: Exclude<CastGrade, "Miss">): CastResponse {
+    const state = this.state;
+    let line = "";
+    if (challenge.successEffect === "drum-counter") {
+      const reflected = this.resolveDrumChallenge(grade);
+      line = grade === "Perfect" ? `리듬 반사 Perfect! ${reflected}발 역반사` : `리듬 반사 성공! ${reflected}발 역반사`;
+    } else if (challenge.successEffect === "mirror-shatter") {
+      const shattered = this.resolveMirrorChallenge(grade);
+      line = grade === "Perfect" ? `거울 분신 완전 파쇄! ${shattered}개 제거` : `거울 분신 파쇄! ${shattered}개 제거`;
+    } else {
+      this.resolveZeroChallenge(grade);
+      line = grade === "Perfect" ? "제로 모션 해방! 잠시 무한 게이지" : "제로 모션 해방! 코어 게이지 회복";
+    }
+
+    state.message = line;
+    this.fxEvents.push({
+      kind: "float-text",
+      x: state.player.x,
+      y: state.player.y - 96,
+      text: grade === "Perfect" ? "PERFECT COUNTER" : "COUNTER",
+      color: grade === "Perfect" ? 0xffd166 : 0x48f7ff
+    });
+    this.fxEvents.push({ kind: "sound", sound: grade === "Perfect" ? "perfect" : "great", grade });
+    return { ok: true, line };
+  }
+
+  private failBossChallenge(challenge: BossChallengeState): CastResponse {
+    const state = this.state;
+    const player = state.player;
+    player.invulnerableTime = 0;
+    player.hurtCooldown = 0;
+
+    if (challenge.bossType === "mirror") {
+      player.controlReverseTime = Math.max(player.controlReverseTime, 3.2);
+      player.movementSlowTime = Math.max(player.movementSlowTime, 1.8);
+      if (challenge.failDamage > 0) {
+        this.damagePlayer(challenge.failDamage);
+      }
+      state.message = "거울 반전: 이동이 뒤틀립니다";
+    } else if (challenge.bossType === "zero") {
+      player.gauge = 0;
+      this.damagePlayer(challenge.failDamage);
+      state.message = "제로 모션: 코어 게이지가 비었습니다";
+      const boss = this.findBoss(challenge.bossType);
+      if (boss) {
+        this.fireZeroMotionPulse(boss);
+      }
+    } else {
+      this.damagePlayer(challenge.failDamage);
+      state.message = "드럼 비트에 밀려났습니다";
+    }
+
+    this.fxEvents.push({
+      kind: "float-text",
+      x: player.x,
+      y: player.y - 92,
+      text: "BREAK FAIL",
+      color: 0xff5ea8
+    });
+    this.fxEvents.push({ kind: "sound", sound: "hit" });
+    return { ok: true, line: state.message };
+  }
+
+  private resolveDrumChallenge(grade: Exclude<CastGrade, "Miss">): number {
+    const state = this.state;
+    const boss = this.findBoss("drum");
+    const reflectedLimit = grade === "Perfect" ? 10 : grade === "Great" ? 7 : 5;
+    let reflected = 0;
+
+    if (boss) {
+      boss.slowTime = Math.max(boss.slowTime, grade === "Perfect" ? 4 : grade === "Great" ? 3 : 2.2);
+      boss.pulseCooldown = Math.max(boss.pulseCooldown, 4.5);
+      this.damageEnemy(boss, grade === "Perfect" ? 180 : grade === "Great" ? 128 : 88, 0xffd166);
+    }
+
+    for (const projectile of state.projectiles) {
+      if (reflected >= reflectedLimit || projectile.owner !== "enemy") {
+        continue;
+      }
+      if (distance(projectile, state.player) > 760) {
+        continue;
+      }
+      const target = boss ?? state.player;
+      const dir = normalize({ x: target.x - projectile.x, y: target.y - projectile.y });
+      projectile.owner = "player";
+      projectile.vx = dir.x * (grade === "Perfect" ? 620 : 520);
+      projectile.vy = dir.y * (grade === "Perfect" ? 620 : 520);
+      projectile.damage = grade === "Perfect" ? 28 : grade === "Great" ? 22 : 17;
+      projectile.ttl = Math.max(projectile.ttl, 1.4);
+      projectile.color = 0xfff0a3;
+      reflected += 1;
+    }
+
+    if (boss && grade === "Perfect") {
+      for (const enemy of [...state.enemies]) {
+        if (enemy.id !== boss.id && distance(enemy, boss) < 260) {
+          this.damageEnemy(enemy, 54, 0xffd166);
+        }
+      }
+      this.fxEvents.push({ kind: "burst", x: boss.x, y: boss.y, radius: 310, color: 0xffd166, grade });
+      this.fxEvents.push({ kind: "shake", intensity: 0.018, duration: 240 });
+    }
+
+    return reflected;
+  }
+
+  private resolveMirrorChallenge(grade: Exclude<CastGrade, "Miss">): number {
+    const state = this.state;
+    const boss = this.findBoss("mirror");
+    const origin = boss ?? state.player;
+    const limit = grade === "Perfect" ? 8 : grade === "Great" ? 5 : 3;
+    const clones = [...state.enemies]
+      .filter((enemy) => enemy.type === "runner" || enemy.type === "swarm")
+      .map((enemy) => ({ enemy, range: distance(enemy, origin) }))
+      .filter((item) => item.range < 760)
+      .sort((a, b) => a.range - b.range)
+      .slice(0, limit);
+
+    for (const { enemy } of clones) {
+      this.damageEnemy(enemy, enemy.hp + 20, 0x48f7ff);
+    }
+    if (boss) {
+      boss.pulseCooldown = Math.max(boss.pulseCooldown, 4);
+      this.damageEnemy(boss, grade === "Perfect" ? 145 : grade === "Great" ? 105 : 72, 0x48f7ff);
+      this.fxEvents.push({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 260 : 190, color: 0x48f7ff, grade });
+    }
+    if (grade === "Perfect") {
+      state.projectiles = state.projectiles.filter((projectile) => projectile.owner !== "enemy" || distance(projectile, origin) > 540);
+    }
+
+    return clones.length;
+  }
+
+  private resolveZeroChallenge(grade: Exclude<CastGrade, "Miss">): void {
+    const state = this.state;
+    const player = state.player;
+    const boss = this.findBoss("zero");
+    player.gauge = clamp(player.gauge + (grade === "Perfect" ? player.maxGauge : grade === "Great" ? 70 : 48), 0, player.maxGauge);
+    if (grade === "Perfect") {
+      player.infiniteGaugeTime = Math.max(player.infiniteGaugeTime, 4.2);
+      for (const slot of Object.keys(state.cooldowns) as SkillSlot[]) {
+        state.cooldowns[slot] = Math.max(0, state.cooldowns[slot] - 2.5);
+      }
+    }
+    if (boss) {
+      boss.pulseCooldown = Math.max(boss.pulseCooldown, 5);
+      this.damageEnemy(boss, grade === "Perfect" ? 160 : grade === "Great" ? 116 : 78, 0xc7b8ff);
+      this.fxEvents.push({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 330 : 230, color: 0xc7b8ff, grade });
+    }
+    this.fxEvents.push({ kind: "shake", intensity: grade === "Perfect" ? 0.02 : 0.012, duration: 240 });
+  }
+
+  private findBoss(type: BossChallengeState["bossType"]): EnemyState | null {
+    return this.state.enemies.find((enemy) => enemy.type === type) ?? null;
   }
 
   private fireDrumPulse(enemy: EnemyState): void {
@@ -1893,13 +2372,21 @@ export class GameSimulation {
   }
 
   private damageEnemy(enemy: EnemyState, amount: number, color: number): void {
-    enemy.hp -= amount;
+    const wasMarked = enemy.markedTime > 0;
+    const typeMultiplier =
+      (enemy.type === "runner" || enemy.type === "swarm" ? 1 + this.state.upgrades.swarmDamageBonus : 1) *
+      (enemy.type === "tank" || enemy.type === "drum" || enemy.type === "mirror" || enemy.type === "zero" ? 1 + this.state.upgrades.eliteDamageBonus : 1);
+    const finalAmount = amount * typeMultiplier;
+    enemy.hp -= finalAmount;
     enemy.hitFlash = 0.12;
+    if (this.state.upgrades.enemySlowOnHitTime > 0) {
+      enemy.slowTime = Math.max(enemy.slowTime, this.state.upgrades.enemySlowOnHitTime);
+    }
     this.fxEvents.push({
       kind: "burst",
       x: enemy.x,
       y: enemy.y,
-      radius: clamp(amount * 1.4, 20, 96),
+      radius: clamp(finalAmount * 1.4, 20, 96),
       color
     });
 
@@ -1916,12 +2403,19 @@ export class GameSimulation {
         return;
       }
       this.state.enemies = this.state.enemies.filter((item) => item.id !== enemy.id);
-      this.state.player.score += Math.round(scoreForEnemy(enemy.type) * (this.state.dailyChallengeId === "accelerated-noise" ? 1.2 : 1));
+      this.state.runStats.kills += 1;
+      this.state.player.score += Math.round(scoreForEnemy(enemy.type) * (this.state.dailyChallengeId === "accelerated-noise" ? 1.2 : 1) * this.state.upgrades.scoreMultiplier);
       this.state.player.gauge = clamp(
         this.state.player.gauge + gaugeForEnemy(enemy.type) * this.state.upgrades.gaugeGainMultiplier,
         0,
         this.state.player.maxGauge
       );
+      if (wasMarked && (this.state.upgrades.markedKillGaugeBonus > 0 || this.state.upgrades.markedKillCooldownRefund > 0)) {
+        this.state.player.gauge = clamp(this.state.player.gauge + this.state.upgrades.markedKillGaugeBonus, 0, this.state.player.maxGauge);
+        for (const slot of Object.keys(this.state.cooldowns) as SkillSlot[]) {
+          this.state.cooldowns[slot] = Math.max(0, this.state.cooldowns[slot] - this.state.upgrades.markedKillCooldownRefund);
+        }
+      }
       this.fxEvents.push({
         kind: "float-text",
         x: enemy.x,
@@ -1942,9 +2436,12 @@ export class GameSimulation {
       return;
     }
 
+    const hpBefore = player.hp;
+    const shieldBefore = player.shield;
     const shieldDamage = Math.min(player.shield, amount);
     player.shield -= shieldDamage;
     player.hp = clamp(player.hp - (amount - shieldDamage), 0, player.maxHp);
+    this.state.runStats.damageTaken += Math.round(Math.max(0, shieldBefore - player.shield) + Math.max(0, hpBefore - player.hp));
     player.hurtCooldown = 0.7;
     this.fxEvents.push({
       kind: "burst",
@@ -1972,12 +2469,18 @@ export class GameSimulation {
       mode: this.state.mode,
       victory,
       score: this.state.player.score,
-      seconds: this.state.modeTime || this.state.time
+      seconds: this.state.modeTime || this.state.time,
+      hpRatio: this.state.player.hp / this.state.player.maxHp,
+      bossClear: victory && this.state.mode !== "survival"
     });
     if (!summary) {
       return;
     }
 
+    this.state.runStats.xpGained = summary.xpGained;
+    this.state.runStats.levelBefore = summary.levelBefore;
+    this.state.runStats.levelAfter = summary.levelAfter;
+    this.state.runStats.unlockedItems = summary.unlockedItems;
     this.state.player.level = summary.levelAfter;
     this.fxEvents.push({
       kind: "float-text",
@@ -2002,15 +2505,38 @@ export class GameSimulation {
   }
 
   private rollRewards(count: number): string[] {
-    const available = REWARDS.map((reward) => reward.id).sort(() => Math.random() - 0.5);
-    return available.slice(0, count);
+    const selected: RewardDefinition[] = [];
+    const isAvailable = (reward: RewardDefinition) =>
+      (reward.characterId === null || reward.characterId === this.state.characterId) &&
+      (this.state.rewardStacks[reward.id] ?? 0) < reward.maxStacks &&
+      !selected.some((item) => item.id === reward.id);
+
+    while (selected.length < count) {
+      const characterPool = REWARDS.filter((reward) => reward.characterId === this.state.characterId && isAvailable(reward));
+      const allPool = REWARDS.filter(isAvailable);
+      if (allPool.length === 0) {
+        break;
+      }
+
+      const preferCharacterCard = characterPool.length > 0 && Math.random() < 0.45;
+      selected.push(pickWeightedReward(preferCharacterCard ? characterPool : allPool));
+    }
+
+    return selected.map((reward) => reward.id);
   }
 
   private applyReward(rewardId: string): void {
     const state = this.state;
+    const reward = getRewardDefinition(rewardId);
+    if (!reward) {
+      return;
+    }
+
+    state.rewardStacks[rewardId] = (state.rewardStacks[rewardId] ?? 0) + 1;
     switch (rewardId) {
       case "forked-slash":
         state.upgrades.slashDamageMultiplier += 0.2;
+        state.upgrades.slashExtraBurstDamageMultiplier += 0.2;
         break;
       case "perfect-tempo":
         state.upgrades.perfectCooldownRefund = Math.max(state.upgrades.perfectCooldownRefund, 0.35);
@@ -2029,7 +2555,7 @@ export class GameSimulation {
         state.upgrades.basicProjectileSpeedMultiplier += 0.1;
         break;
       case "delivery-guard":
-        state.upgrades.dashShield = Math.max(state.upgrades.dashShield, 18);
+        state.upgrades.dashShield += 18;
         break;
       case "charged-heart":
         state.player.maxHp += 20;
@@ -2040,8 +2566,182 @@ export class GameSimulation {
         state.upgrades.overdriveDamageMultiplier += 0.15;
         break;
       case "combo-battery":
-        state.upgrades.gaugeGainMultiplier += 0.25;
+        state.upgrades.perfectGaugeBonus += 10;
         state.player.gauge = clamp(state.player.gauge + 18, 0, state.player.maxGauge);
+        break;
+      case "motion-resonance":
+        state.upgrades.globalDamageMultiplier += 0.12;
+        break;
+      case "core-pocket":
+        state.player.maxGauge += 20;
+        state.player.gauge = clamp(state.player.gauge + 20, 0, state.player.maxGauge);
+        break;
+      case "quick-reset":
+        state.upgrades.cooldownMultiplier *= 0.92;
+        break;
+      case "cast-amplifier":
+        state.upgrades.skillDamageMultiplier += 0.16;
+        break;
+      case "wide-gesture":
+        state.upgrades.areaMultiplier *= 1.1;
+        break;
+      case "safe-failure":
+        state.upgrades.missCooldownMultiplier *= 0.65;
+        break;
+      case "last-stand":
+        state.upgrades.lowHpDamageBonus += 0.28;
+        break;
+      case "kinetic-heal":
+        state.upgrades.dashHeal += 2;
+        state.upgrades.dashShield += 5;
+        break;
+      case "shield-spark":
+        state.upgrades.shieldedDamageBonus += 0.18;
+        break;
+      case "focus-route":
+        state.upgrades.sameSkillDamageBonus += 0.08;
+        break;
+      case "rapid-reload":
+        state.upgrades.basicAttackRateMultiplier += 0.25;
+        break;
+      case "battery-heart":
+        state.player.maxHp += 10;
+        state.player.hp = clamp(state.player.hp + 10, 0, state.player.maxHp);
+        state.player.maxGauge += 10;
+        state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
+        break;
+      case "perfect-discipline":
+        state.upgrades.perfectGaugeBonus += 8;
+        break;
+      case "wave-cleaner":
+        state.upgrades.swarmDamageBonus += 0.24;
+        break;
+      case "elite-hunter":
+        state.upgrades.eliteDamageBonus += 0.22;
+        break;
+      case "score-hunter":
+        state.upgrades.scoreMultiplier += 0.2;
+        state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
+        break;
+      case "thunder-fork":
+        state.upgrades.chainDamageMultiplier += 0.18;
+        state.upgrades.chainDecayMultiplier = Math.min(0.98, state.upgrades.chainDecayMultiplier + 0.03);
+        break;
+      case "courier-boosters":
+        state.upgrades.dashLengthMultiplier *= 1.2;
+        state.upgrades.dashStrikeWidthMultiplier *= 1.1;
+        break;
+      case "blue-afterimage":
+        state.upgrades.slashRangeMultiplier *= 1.16;
+        state.upgrades.slashWidthMultiplier *= 1.12;
+        break;
+      case "static-routing":
+        state.upgrades.chainExtraTargets += 1;
+        state.upgrades.chainDamageMultiplier += 0.08;
+        break;
+      case "voltage-rush":
+        state.upgrades.dashSkillDamageMultiplier += 0.2;
+        break;
+      case "air-splitting-slash":
+        state.upgrades.slashDamageMultiplier += 0.14;
+        state.upgrades.slashExtraBurstDamageMultiplier += 0.25;
+        break;
+      case "lightning-parcel":
+        state.upgrades.dashSkillDamageMultiplier += 0.2;
+        state.upgrades.dashGaugeGain += 4;
+        break;
+      case "overdrive-battery":
+        state.upgrades.overdriveGaugeRefund += 12;
+        state.upgrades.overdriveDurationBonus += 1;
+        break;
+      case "oni-brace":
+        state.upgrades.guardShieldMultiplier *= 1.25;
+        break;
+      case "rebound-practice":
+        state.upgrades.reflectDamageBonus += 12;
+        state.upgrades.guardChargeMultiplier += 0.18;
+        break;
+      case "fortress-heart":
+        state.upgrades.shieldedDamageBonus += 0.22;
+        break;
+      case "push-wave":
+        state.upgrades.shieldPushRangeMultiplier *= 1.15;
+        state.upgrades.pushKnockbackMultiplier *= 1.3;
+        break;
+      case "ground-resonance":
+        state.upgrades.earthDrumRadiusMultiplier *= 1.18;
+        state.upgrades.earthDrumDamageMultiplier += 0.1;
+        break;
+      case "wall-tax":
+        state.upgrades.shieldWallDurationBonus += 1.5;
+        state.upgrades.shieldWallReflectBonus += 15;
+        break;
+      case "guardian-oath":
+        state.upgrades.guardHeal += 4;
+        break;
+      case "shield-carpenter":
+        state.player.maxHp += 15;
+        state.player.hp = clamp(state.player.hp + 15, 0, state.player.maxHp);
+        state.upgrades.guardShieldMultiplier *= 1.1;
+        state.upgrades.dashShield += 6;
+        break;
+      case "mark-cache":
+        state.upgrades.markExtraTargets += 1;
+        break;
+      case "glitch-refund":
+        state.upgrades.markedKillCooldownRefund += 0.35;
+        state.upgrades.markedKillGaugeBonus += 5;
+        break;
+      case "trap-stack":
+        state.upgrades.trapRadiusMultiplier *= 1.14;
+        state.upgrades.trapTtlBonus += 1;
+        break;
+      case "silent-execute":
+        state.upgrades.shadowCutDamageMultiplier += 0.22;
+        state.upgrades.markedDamageMultiplier += 0.12;
+        break;
+      case "blackout-script":
+        state.upgrades.blackoutRadiusMultiplier *= 1.12;
+        state.upgrades.blackoutSlowBonus += 1.2;
+        break;
+      case "mirror-bug":
+        state.upgrades.markDurationBonus += 2;
+        state.upgrades.markDamageMultiplier += 0.12;
+        break;
+      case "cut-through":
+        state.upgrades.shadowCutExtraTargets += 1;
+        break;
+      case "system-lag":
+        state.upgrades.enemySlowOnHitTime += 0.35;
+        break;
+      case "extra-slime":
+        state.upgrades.slimeSummonBonus += 1;
+        break;
+      case "jelly-splash":
+        state.upgrades.jellyRadiusMultiplier *= 1.14;
+        state.upgrades.jellyDamageMultiplier += 0.1;
+        break;
+      case "sweet-recovery":
+        state.upgrades.jellyHealBonus += 5;
+        state.upgrades.sweetFieldHealBonus += 5;
+        break;
+      case "slime-chef":
+        state.upgrades.slimeDamageMultiplier += 0.18;
+        state.upgrades.slimeTtlBonus += 2;
+        break;
+      case "party-leftovers":
+        state.upgrades.slimePartyBonus += 2;
+        break;
+      case "sticky-syrup":
+        state.upgrades.enemySlowOnHitTime += 0.45;
+        state.upgrades.sweetFieldRadiusMultiplier *= 1.08;
+        break;
+      case "bouncing-bomb":
+        state.upgrades.jellySweetFieldRadius += 80;
+        break;
+      case "giant-recipe":
+        state.upgrades.bigSlimeDamageMultiplier += 0.25;
+        state.upgrades.bigSlimeTtlBonus += 2;
         break;
       default:
         break;
@@ -2054,6 +2754,34 @@ export class GameSimulation {
       x: (right ? 1 : 0) - (left ? 1 : 0),
       y: (down ? 1 : 0) - (up ? 1 : 0)
     };
+  }
+}
+
+function pickWeightedReward(pool: RewardDefinition[]): RewardDefinition {
+  const totalWeight = pool.reduce((sum, reward) => sum + rarityWeight(reward.rarity), 0);
+  let roll = Math.random() * totalWeight;
+  for (const reward of pool) {
+    roll -= rarityWeight(reward.rarity);
+    if (roll <= 0) {
+      return reward;
+    }
+  }
+  return pool[pool.length - 1];
+}
+
+function rarityWeight(rarity: RewardRarity): number {
+  switch (rarity) {
+    case "legendary":
+      return 0.08;
+    case "epic":
+      return 0.18;
+    case "rare":
+      return 0.42;
+    case "uncommon":
+      return 0.74;
+    case "common":
+    default:
+      return 1;
   }
 }
 

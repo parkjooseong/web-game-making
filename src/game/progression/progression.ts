@@ -1,6 +1,6 @@
 import { ADVENTURE_STAGES } from "../content/adventure";
 import { CHARACTER_ORDER, getSkillsForCharacter } from "../content/skills";
-import type { CastGrade, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, EnemyType, GameMode } from "../simulation/types";
+import type { CastGrade, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, EnemyType, GameMode, UnlockedItem } from "../simulation/types";
 
 export interface CoreDefinition {
   id: CoreId;
@@ -78,6 +78,7 @@ export interface RunSummary {
   xpGained: number;
   levelBefore: number;
   levelAfter: number;
+  unlockedItems: UnlockedItem[];
 }
 
 export interface AdventureStageClearResult extends AdventureStageProgress {
@@ -101,6 +102,10 @@ export interface ProgressSnapshot {
 }
 
 const STORAGE_KEY = "movecasters.pose-break.progress.v1";
+
+const defaultUnlockedCoreIds: CoreId[] = ["stability-core"];
+const defaultUnlockedSkinIds: CharacterSkinId[] = ["rio-default", "maru-default", "neon-default", "cookie-default"];
+const defaultUnlockedEffectPaletteIds: EffectPaletteId[] = ["classic"];
 
 export const CORES: CoreDefinition[] = [
   {
@@ -416,9 +421,14 @@ const DAILY_POOL: Omit<DailyChallenge, "dateKey">[] = [
 export class ProgressionStore {
   private snapshot: ProgressSnapshot;
   private listeners = new Set<(snapshot: ProgressSnapshot) => void>();
+  private pendingUnlockedItems: UnlockedItem[] = [];
 
   constructor() {
     this.snapshot = this.load();
+    if (this.evaluateUnlocks().length > 0) {
+      this.pendingUnlockedItems = [];
+      this.save();
+    }
   }
 
   getSnapshot(): ProgressSnapshot {
@@ -532,6 +542,7 @@ export class ProgressionStore {
       this.snapshot.selectedAdventureStageId = nextStage.id;
     }
 
+    this.evaluateUnlocks();
     this.save();
     return { ...nextProgress, grade, isNewBest };
   }
@@ -546,10 +557,11 @@ export class ProgressionStore {
     }
     skill.level = calculateSkillLevel(skill.uses, skill.perfects);
     this.snapshot.skills[skillId] = skill;
+    this.evaluateUnlocks();
     this.save();
   }
 
-  recordRun(input: { characterId: CharacterId; mode: GameMode; victory: boolean; score: number; seconds: number }): RunSummary {
+  recordRun(input: { characterId: CharacterId; mode: GameMode; victory: boolean; score: number; seconds: number; hpRatio: number; bossClear: boolean }): RunSummary {
     const character = this.snapshot.characters[input.characterId];
     const levelBefore = character.level;
     const modeBonus =
@@ -567,8 +579,90 @@ export class ProgressionStore {
       character.victories += 1;
     }
     character.level = calculateCharacterLevel(character.xp);
+    this.evaluateUnlocks(input);
     this.save();
-    return { xpGained, levelBefore, levelAfter: character.level };
+    return { xpGained, levelBefore, levelAfter: character.level, unlockedItems: this.drainUnlockedItems() };
+  }
+
+  evaluateUnlocks(context: Partial<{ characterId: CharacterId; mode: GameMode; victory: boolean; hpRatio: number; bossClear: boolean }> = {}): UnlockedItem[] {
+    const unlocked: UnlockedItem[] = [];
+    const addUnlock = (item: UnlockedItem) => {
+      unlocked.push(item);
+      this.pendingUnlockedItems.push(item);
+    };
+    const unlockCore = (coreId: CoreId) => {
+      if (this.snapshot.unlockedCoreIds.includes(coreId)) {
+        return;
+      }
+      const core = getCoreDefinition(coreId);
+      this.snapshot.unlockedCoreIds.push(coreId);
+      addUnlock({ type: "core", id: coreId, title: core.title, description: core.description });
+    };
+    const unlockSkin = (skinId: CharacterSkinId) => {
+      if (this.snapshot.unlockedSkinIds.includes(skinId)) {
+        return;
+      }
+      const skin = getSkinDefinition(skinId);
+      this.snapshot.unlockedSkinIds.push(skinId);
+      addUnlock({ type: "skin", id: skinId, title: skin.title, description: skin.description });
+    };
+    const unlockPalette = (paletteId: EffectPaletteId) => {
+      if (this.snapshot.unlockedEffectPaletteIds.includes(paletteId)) {
+        return;
+      }
+      const palette = getEffectPaletteDefinition(paletteId);
+      this.snapshot.unlockedEffectPaletteIds.push(paletteId);
+      addUnlock({ type: "effect", id: paletteId, title: palette.title, description: palette.description });
+    };
+
+    const totalPerfectCasts = Object.values(this.snapshot.characters).reduce((sum, character) => sum + character.perfectCasts, 0);
+    const sameSkillMastered = Object.values(this.snapshot.skills).some((skill) => skill.uses >= 50);
+    const sRankStages = Object.values(this.snapshot.adventureStages).filter((stage) => stage.bestGrade === "S").length;
+
+    if (context.mode === "story" && context.victory) {
+      unlockCore("echo-core");
+    }
+    if (totalPerfectCasts >= 30) {
+      unlockCore("rhythm-core");
+    }
+    if (context.characterId === "maru" && context.victory && context.bossClear) {
+      unlockCore("guard-core");
+    }
+    if (context.victory && (context.hpRatio ?? 1) <= 0.4) {
+      unlockCore("rampage-core");
+    }
+    if (sameSkillMastered) {
+      unlockCore("focus-core");
+    }
+
+    if (totalPerfectCasts >= 100) {
+      unlockPalette("neon-pop");
+    }
+    if (sRankStages >= 3) {
+      unlockPalette("gold-rush");
+    }
+    if (this.snapshot.characters.cookie.level >= 5) {
+      unlockPalette("slime-soda");
+    }
+
+    for (const characterId of CHARACTER_ORDER) {
+      const progress = this.snapshot.characters[characterId];
+      const skins = getSkinsForCharacter(characterId).filter((skin) => skin.id !== getDefaultSkinId(characterId));
+      if (progress.level >= 2 && skins[0]) {
+        unlockSkin(skins[0].id);
+      }
+      if (progress.level >= 5 && skins[1]) {
+        unlockSkin(skins[1].id);
+      }
+    }
+
+    return unlocked;
+  }
+
+  private drainUnlockedItems(): UnlockedItem[] {
+    const items = this.pendingUnlockedItems;
+    this.pendingUnlockedItems = [];
+    return items;
   }
 
   subscribe(listener: (snapshot: ProgressSnapshot) => void): () => void {
@@ -669,16 +763,16 @@ function createDefaultSnapshot(): ProgressSnapshot {
   return {
     characters,
     skills,
-    unlockedCoreIds: CORES.map((core) => core.id),
+    unlockedCoreIds: [...defaultUnlockedCoreIds],
     equippedCoreId: "stability-core",
-    unlockedSkinIds: SKINS.map((skin) => skin.id),
+    unlockedSkinIds: [...defaultUnlockedSkinIds],
     equippedSkins: {
       rio: "rio-default",
       maru: "maru-default",
       neon: "neon-default",
       cookie: "cookie-default"
     },
-    unlockedEffectPaletteIds: EFFECT_PALETTES.map((palette) => palette.id),
+    unlockedEffectPaletteIds: [...defaultUnlockedEffectPaletteIds],
     equippedEffectPaletteId: "classic",
     discoveredEnemyTypes: ["runner", "shooter"],
     selectedAdventureStageId: ADVENTURE_STAGES[0]?.id ?? "1-1",
@@ -689,9 +783,22 @@ function createDefaultSnapshot(): ProgressSnapshot {
 
 function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
   const fallback = createDefaultSnapshot();
-  const equippedCoreId = CORES.some((core) => core.id === input.equippedCoreId) ? input.equippedCoreId as CoreId : fallback.equippedCoreId;
+  const resetLegacyUnlocks = shouldResetLegacyUnlocks(input);
+  const unlockedCoreIds = ensureIncludes(
+    resetLegacyUnlocks
+      ? fallback.unlockedCoreIds
+      : input.unlockedCoreIds?.filter((coreId): coreId is CoreId => CORES.some((core) => core.id === coreId)) ?? fallback.unlockedCoreIds,
+    defaultUnlockedCoreIds
+  );
+  const equippedCoreCandidate = CORES.some((core) => core.id === input.equippedCoreId) ? input.equippedCoreId as CoreId : fallback.equippedCoreId;
+  const equippedCoreId = unlockedCoreIds.includes(equippedCoreCandidate) ? equippedCoreCandidate : fallback.equippedCoreId;
   const unlockedSkinIds =
-    input.unlockedSkinIds?.filter((skinId): skinId is CharacterSkinId => SKINS.some((skin) => skin.id === skinId)) ?? fallback.unlockedSkinIds;
+    ensureIncludes(
+      resetLegacyUnlocks
+        ? fallback.unlockedSkinIds
+        : input.unlockedSkinIds?.filter((skinId): skinId is CharacterSkinId => SKINS.some((skin) => skin.id === skinId)) ?? fallback.unlockedSkinIds,
+      defaultUnlockedSkinIds
+    );
   const equippedSkins = { ...fallback.equippedSkins, ...input.equippedSkins };
   for (const characterId of CHARACTER_ORDER) {
     const skinId = equippedSkins[characterId];
@@ -701,8 +808,13 @@ function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
     }
   }
   const unlockedEffectPaletteIds =
-    input.unlockedEffectPaletteIds?.filter((paletteId): paletteId is EffectPaletteId => EFFECT_PALETTES.some((palette) => palette.id === paletteId)) ??
-    fallback.unlockedEffectPaletteIds;
+    ensureIncludes(
+      resetLegacyUnlocks
+        ? fallback.unlockedEffectPaletteIds
+        : input.unlockedEffectPaletteIds?.filter((paletteId): paletteId is EffectPaletteId => EFFECT_PALETTES.some((palette) => palette.id === paletteId)) ??
+          fallback.unlockedEffectPaletteIds,
+      defaultUnlockedEffectPaletteIds
+    );
   const equippedEffectPaletteId = EFFECT_PALETTES.some((palette) => palette.id === input.equippedEffectPaletteId)
     ? input.equippedEffectPaletteId as EffectPaletteId
     : fallback.equippedEffectPaletteId;
@@ -722,7 +834,7 @@ function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
     ...input,
     characters: { ...fallback.characters, ...input.characters },
     skills: { ...fallback.skills, ...input.skills },
-    unlockedCoreIds: input.unlockedCoreIds?.filter((coreId): coreId is CoreId => CORES.some((core) => core.id === coreId)) ?? fallback.unlockedCoreIds,
+    unlockedCoreIds,
     equippedCoreId,
     unlockedSkinIds,
     equippedSkins,
@@ -762,6 +874,27 @@ function normalizeAdventureStageProgress(input?: Partial<AdventureStageProgress>
     bestSeconds: Math.max(0, input?.bestSeconds ?? 0),
     bestGrade: input?.bestGrade === "S" || input?.bestGrade === "A" || input?.bestGrade === "B" || input?.bestGrade === "C" ? input.bestGrade : null
   };
+}
+
+function ensureIncludes<T>(items: T[], required: T[]): T[] {
+  return Array.from(new Set([...items, ...required]));
+}
+
+function shouldResetLegacyUnlocks(input: Partial<ProgressSnapshot>): boolean {
+  const hadEverythingUnlocked =
+    input.unlockedCoreIds?.length === CORES.length &&
+    input.unlockedSkinIds?.length === SKINS.length &&
+    input.unlockedEffectPaletteIds?.length === EFFECT_PALETTES.length;
+  if (!hadEverythingUnlocked) {
+    return false;
+  }
+
+  const hasCharacterProgress = Object.values(input.characters ?? {}).some(
+    (character) => (character?.xp ?? 0) > 0 || (character?.runs ?? 0) > 0 || (character?.victories ?? 0) > 0 || (character?.perfectCasts ?? 0) > 0
+  );
+  const hasSkillProgress = Object.values(input.skills ?? {}).some((skill) => (skill?.uses ?? 0) > 0 || (skill?.perfects ?? 0) > 0);
+  const hasAdventureProgress = Object.values(input.adventureStages ?? {}).some((stage) => (stage?.clears ?? 0) > 0);
+  return !hasCharacterProgress && !hasSkillProgress && !hasAdventureProgress;
 }
 
 function calculateAdventureGrade(score: number, seconds: number, hpRatio: number): AdventureGrade {

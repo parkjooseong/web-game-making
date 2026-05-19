@@ -3,7 +3,7 @@ import { getCharacter } from "../../game/content/skills";
 import type { SkillSlot } from "../../game/input/actions";
 import { getEffectPaletteDefinition } from "../../game/progression/progression";
 import { GameSimulation, WORLD_HEIGHT, WORLD_WIDTH } from "../../game/simulation/GameSimulation";
-import type { CastGrade, CharacterId, CharacterSkinId, EffectPaletteId, FxEvent, SimulationInput, SoundId } from "../../game/simulation/types";
+import type { CastGrade, CharacterId, CharacterSkinId, EffectPaletteId, FxEvent, GameState, SimulationInput, SoundId } from "../../game/simulation/types";
 import type { PoseService } from "../../game/pose/PoseService";
 import type { Hud } from "../../ui/hud/Hud";
 
@@ -36,6 +36,14 @@ interface ViewFx {
   ttl: number;
 }
 
+interface FloatingTextFx {
+  object: Phaser.GameObjects.Text;
+  age: number;
+  ttl: number;
+  startY: number;
+  drift: number;
+}
+
 interface ChibiColors {
   jacket: number;
   trim: number;
@@ -52,7 +60,9 @@ export class BattleScene extends Phaser.Scene {
   private gridGraphics!: Phaser.GameObjects.Graphics;
   private keys!: KeyMap;
   private viewFx: ViewFx[] = [];
+  private floatingTexts: FloatingTextFx[] = [];
   private audioContext: AudioContext | null = null;
+  private bossChallengeCaptureKey = "";
 
   constructor(
     private readonly simulation: GameSimulation,
@@ -68,6 +78,7 @@ export class BattleScene extends Phaser.Scene {
     this.worldGraphics = this.add.graphics();
     this.fxGraphics = this.add.graphics();
     this.drawGrid();
+    this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => this.clearFloatingTexts());
 
     const keyboard = this.input.keyboard;
     if (!keyboard) {
@@ -107,6 +118,7 @@ export class BattleScene extends Phaser.Scene {
     this.simulation.update(deltaMs / 1000, input);
 
     const state = this.simulation.getState();
+    this.handleBossChallengeCapture(state);
     this.cameras.main.centerOn(state.player.x, state.player.y);
     this.collectFx();
     this.drawWorld(deltaMs / 1000);
@@ -223,15 +235,49 @@ export class BattleScene extends Phaser.Scene {
 
     void this.poseService.capture(skill.gestureId).then((result) => {
       const cast = this.simulation.castPreparedSkill(result);
-      this.hud.showCastResult(result.grade, cast.line);
+      if (cast.ok) {
+        this.hud.showCastResult(result.grade, cast.line);
+      }
     });
   }
 
   private debugCast(grade: Exclude<CastGrade, "Miss">): void {
+    const hadBossChallenge = Boolean(this.simulation.getState().bossChallenge);
     const response = this.simulation.castDebugGrade(grade);
     if (response.ok) {
-      this.hud.showCastResult(grade, response.line);
+      if (hadBossChallenge) {
+        this.hud.showBossChallengeResult(grade, response.line);
+      } else {
+        this.hud.showCastResult(grade, response.line);
+      }
     }
+  }
+
+  private handleBossChallengeCapture(state: GameState): void {
+    const challenge = state.bossChallenge;
+    if (!challenge) {
+      this.bossChallengeCaptureKey = "";
+      return;
+    }
+
+    const captureKey = `${challenge.bossType}:${challenge.requiredGesture}:${challenge.expiresAt}`;
+    if (this.bossChallengeCaptureKey === captureKey) {
+      return;
+    }
+
+    this.bossChallengeCaptureKey = captureKey;
+    this.hud.showBossChallengeCapture(challenge);
+    if (!this.poseService.isReady()) {
+      return;
+    }
+
+    const durationMs = Math.max(260, (challenge.expiresAt - state.time) * 1000);
+    void this.poseService.capture(challenge.requiredGesture, durationMs).then((result) => {
+      const cast = this.simulation.castBossChallenge(result);
+      if (cast.ok) {
+        this.hud.showBossChallengeResult(result.grade, cast.line);
+      }
+    });
   }
 
   private collectFx(): void {
@@ -244,9 +290,36 @@ export class BattleScene extends Phaser.Scene {
         this.playSound(event.sound, event.grade);
         continue;
       }
-      const ttl = event.kind === "float-text" ? 0.75 : event.kind === "bolt" ? 0.2 : 0.34;
+      if (event.kind === "float-text") {
+        this.spawnFloatingText(event);
+        continue;
+      }
+      const ttl = event.kind === "bolt" ? 0.2 : 0.34;
       this.viewFx.push({ event, age: 0, ttl });
     }
+  }
+
+  private spawnFloatingText(event: Extract<FxEvent, { kind: "float-text" }>): void {
+    const important = isLargeFloatingText(event.text);
+    const text = this.add.text(event.x, event.y, event.text, {
+      fontFamily: "Inter, system-ui, sans-serif",
+      fontSize: important ? "26px" : "15px",
+      fontStyle: "900",
+      color: hexColor(event.color),
+      stroke: "#061018",
+      strokeThickness: important ? 6 : 4,
+      align: "center"
+    });
+    text.setOrigin(0.5, 0.5);
+    text.setDepth(60);
+    text.setShadow(0, 0, hexColor(event.color), important ? 14 : 8, true, true);
+    this.floatingTexts.push({
+      object: text,
+      age: 0,
+      ttl: 0.75,
+      startY: event.y,
+      drift: important ? 66 : 44
+    });
   }
 
   private drawGrid(): void {
@@ -651,6 +724,7 @@ export class BattleScene extends Phaser.Scene {
   private drawFx(dt: number): void {
     const graphics = this.fxGraphics;
     graphics.clear();
+    this.updateFloatingTexts(dt);
     const remaining: ViewFx[] = [];
     const effectPaletteId = this.simulation.getState().effectPaletteId;
 
@@ -684,9 +758,6 @@ export class BattleScene extends Phaser.Scene {
           graphics.lineBetween(from.x, from.y, midX, midY);
           graphics.lineBetween(midX, midY, to.x, to.y);
         }
-      } else if (event.kind === "float-text") {
-        graphics.fillStyle(color, alpha);
-        graphics.fillCircle(event.x, event.y - t * 44, 12 + t * 10);
       }
 
       if (fx.age < fx.ttl) {
@@ -695,6 +766,33 @@ export class BattleScene extends Phaser.Scene {
     }
 
     this.viewFx = remaining;
+  }
+
+  private updateFloatingTexts(dt: number): void {
+    const remaining: FloatingTextFx[] = [];
+
+    for (const fx of this.floatingTexts) {
+      fx.age += dt;
+      const t = Math.min(1, fx.age / fx.ttl);
+      fx.object.setY(fx.startY - fx.drift * easeOutCubic(t));
+      fx.object.setAlpha(1 - t);
+      fx.object.setScale(1 + 0.08 * Math.sin(t * Math.PI));
+
+      if (fx.age < fx.ttl) {
+        remaining.push(fx);
+      } else {
+        fx.object.destroy();
+      }
+    }
+
+    this.floatingTexts = remaining;
+  }
+
+  private clearFloatingTexts(): void {
+    for (const fx of this.floatingTexts) {
+      fx.object.destroy();
+    }
+    this.floatingTexts = [];
   }
 
   private async resumeAudio(): Promise<void> {
@@ -744,6 +842,19 @@ function pointAt(x: number, y: number, angle: number, distance: number): { x: nu
     x: x + Math.cos(angle) * distance,
     y: y + Math.sin(angle) * distance
   };
+}
+
+function hexColor(color: number): string {
+  return `#${color.toString(16).padStart(6, "0")}`;
+}
+
+function isLargeFloatingText(text: string): boolean {
+  const normalized = text.toUpperCase();
+  return ["PERFECT", "STAGE CLEAR", "OVERDRIVE", "CORE DRAIN", "BOSS", "CLEAR"].some((token) => normalized.includes(token));
+}
+
+function easeOutCubic(value: number): number {
+  return 1 - Math.pow(1 - value, 3);
 }
 
 function getChibiColors(characterId: CharacterId, skinId: CharacterSkinId, baseColor: number): ChibiColors {

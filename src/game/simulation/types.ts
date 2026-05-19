@@ -33,8 +33,17 @@ export type GestureId =
   | "focus-triangle";
 export type CastGrade = "Miss" | "Normal" | "Great" | "Perfect";
 export type EnemyType = "runner" | "shooter" | "swarm" | "tank" | "drum" | "mirror" | "zero" | "dummy";
+export type BossType = "drum" | "mirror" | "zero";
 export type ProjectileOwner = "player" | "enemy";
 export type SoundId = "prepare" | "normal" | "great" | "perfect" | "dash" | "hit" | "enemy-down" | "reward" | "boss";
+export type UnlockItemType = "core" | "skin" | "effect";
+
+export interface UnlockedItem {
+  type: UnlockItemType;
+  id: CoreId | CharacterSkinId | EffectPaletteId;
+  title: string;
+  description: string;
+}
 
 export interface GestureResult {
   gestureId: GestureId;
@@ -69,6 +78,9 @@ export interface PlayerState extends Vector2 {
   overdriveTime: number;
   guardCharge: number;
   shieldWallTime: number;
+  controlReverseTime: number;
+  movementSlowTime: number;
+  infiniteGaugeTime: number;
   score: number;
   lastSkillId: string | null;
   sameSkillChain: number;
@@ -130,17 +142,129 @@ export interface PreparedSkillState {
   expiresAt: number;
 }
 
+export interface BossChallengeState {
+  bossType: BossType;
+  requiredGesture: GestureId;
+  prompt: string;
+  expiresAt: number;
+  successEffect: "drum-counter" | "mirror-shatter" | "zero-release";
+  failDamage: number;
+}
+
+export interface RunStats {
+  kills: number;
+  perfectCasts: number;
+  greatCasts: number;
+  normalCasts: number;
+  misses: number;
+  maxPerfectCombo: number;
+  damageTaken: number;
+  skillsUsed: number;
+  rewardsChosen: string[];
+  unlockedItems: UnlockedItem[];
+  xpGained: number;
+  levelBefore: number;
+  levelAfter: number;
+}
+
+export interface TrainingMissionState {
+  id: string;
+  gestureId: GestureId;
+  title: string;
+  prompt: string;
+  targetSuccesses: number;
+  successes: number;
+  attempts: number;
+  perfects: number;
+  completed: boolean;
+  rewardKey: string;
+}
+
+export interface TrainingLastResult {
+  gestureId: GestureId;
+  score: number;
+  grade: CastGrade;
+  reason: string;
+  at: number;
+}
+
+export interface TrainingState {
+  missions: TrainingMissionState[];
+  lastResult: TrainingLastResult | null;
+  completedRewardKeys: string[];
+}
+
 export interface PlayerUpgrades {
+  globalDamageMultiplier: number;
+  skillDamageMultiplier: number;
   slashDamageMultiplier: number;
+  slashRangeMultiplier: number;
+  slashWidthMultiplier: number;
+  slashExtraBurstDamageMultiplier: number;
   perfectCooldownRefund: number;
+  perfectGaugeBonus: number;
+  cooldownMultiplier: number;
+  missCooldownMultiplier: number;
   dashSkillDamageMultiplier: number;
+  dashLengthMultiplier: number;
+  dashStrikeWidthMultiplier: number;
+  dashHeal: number;
+  dashGaugeGain: number;
   gaugeGainMultiplier: number;
+  scoreMultiplier: number;
+  areaMultiplier: number;
+  lowHpDamageBonus: number;
+  shieldedDamageBonus: number;
+  sameSkillDamageBonus: number;
+  swarmDamageBonus: number;
+  eliteDamageBonus: number;
   chainExtraTargets: number;
+  chainDamageMultiplier: number;
+  chainDecayMultiplier: number;
   basicAttackRateMultiplier: number;
   basicProjectileSpeedMultiplier: number;
+  basicDamageMultiplier: number;
   dashShield: number;
   overdriveDurationBonus: number;
   overdriveDamageMultiplier: number;
+  overdriveGaugeRefund: number;
+  guardShieldMultiplier: number;
+  guardChargeMultiplier: number;
+  guardHeal: number;
+  reflectDamageBonus: number;
+  shieldPushRangeMultiplier: number;
+  pushKnockbackMultiplier: number;
+  earthDrumRadiusMultiplier: number;
+  earthDrumDamageMultiplier: number;
+  shieldWallRadiusMultiplier: number;
+  shieldWallDurationBonus: number;
+  shieldWallReflectBonus: number;
+  markExtraTargets: number;
+  markDurationBonus: number;
+  markDamageMultiplier: number;
+  markedDamageMultiplier: number;
+  markedKillGaugeBonus: number;
+  markedKillCooldownRefund: number;
+  shadowCutExtraTargets: number;
+  shadowCutDamageMultiplier: number;
+  trapRadiusMultiplier: number;
+  trapDamageMultiplier: number;
+  trapTtlBonus: number;
+  blackoutRadiusMultiplier: number;
+  blackoutSlowBonus: number;
+  enemySlowOnHitTime: number;
+  jellyRadiusMultiplier: number;
+  jellyDamageMultiplier: number;
+  jellyHealBonus: number;
+  jellySweetFieldRadius: number;
+  slimeSummonBonus: number;
+  slimeDamageMultiplier: number;
+  slimeTtlBonus: number;
+  sweetFieldRadiusMultiplier: number;
+  sweetFieldHealBonus: number;
+  slimePartyBonus: number;
+  bigSlimeDamageMultiplier: number;
+  bigSlimeTtlBonus: number;
 }
 
 export interface GameState {
@@ -171,9 +295,13 @@ export interface GameState {
   spawnQueue: EnemyType[];
   spawnTimer: number;
   pendingRewardIds: string[];
+  rewardStacks: Record<string, number>;
   preparedSkill: PreparedSkillState | null;
+  bossChallenge: BossChallengeState | null;
   cooldowns: Record<SkillSlot, number>;
   player: PlayerState;
+  runStats: RunStats;
+  training: TrainingState;
   enemies: EnemyState[];
   projectiles: ProjectileState[];
   traps: TrapState[];

@@ -1,0 +1,8 @@
+node_modules/
+dist/
+.vite/
+*.log
+coverage/
+.chrome-*/
+chrome-cdp.log
+playtest-*.png

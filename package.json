@@ -1,0 +1,25 @@
+{
+  "name": "movecasters-pose-break",
+  "version": "1.0.0",
+  "description": "Webcam gesture casting top-down action roguelite prototype.",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "build": "tsc --noEmit && vite build",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview --host 127.0.0.1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "UNLICENSED",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@mediapipe/tasks-vision": "^0.10.35",
+    "phaser": "^4.1.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.3",
+    "vite": "^8.0.13",
+    "ws": "^8.20.1"
+  }
+}

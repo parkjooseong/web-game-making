@@ -1,6 +1,25 @@
 import { ADVENTURE_STAGES } from "../content/adventure";
 import { CHARACTER_ORDER, getSkillsForCharacter } from "../content/skills";
-import type { CastGrade, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, EnemyType, GameMode, UnlockedItem } from "../simulation/types";
+import type {
+  AchievementId,
+  AchievementUnlock,
+  BossType,
+  CastGrade,
+  CharacterId,
+  CharacterSkinId,
+  CoreId,
+  EffectPaletteId,
+  EnemyType,
+  GameMode,
+  UnlockedItem
+} from "../simulation/types";
+import {
+  ACHIEVEMENTS,
+  createAchievementUnlock,
+  getAchievementProgress,
+  type AchievementProgress
+} from "./achievements";
+import { UNLOCK_CONDITIONS, isUnlockConditionMet } from "./unlocks";
 
 export interface CoreDefinition {
   id: CoreId;
@@ -28,6 +47,29 @@ export interface DailyChallenge {
   title: string;
   description: string;
   dateKey: string;
+  modifiers: DailyChallengeModifiers;
+}
+
+export interface DailyChallengeModifiers {
+  playerHpMultiplier: number;
+  startingGauge: number;
+  enemySpeedMultiplier: number;
+  enemyHpMultiplier: number;
+  enemyScoreMultiplier: number;
+  skillCooldownMultiplier: number;
+  perfectDamageMultiplier: number;
+  perfectGaugeGain: number;
+  missCooldownMultiplier: number;
+  killGaugeMultiplier: number;
+  dashCooldownMultiplier: number;
+  dashSkillDamageBonus: number;
+  swarmSpawnBonus: number;
+  areaDamageMultiplier: number;
+  bossHpMultiplier: number;
+  bossScoreMultiplier: number;
+  oneHandSkillDamageMultiplier: number;
+  randomCore: boolean;
+  mirrorZeroSpawnBonus: number;
 }
 
 export interface SkinDefinition {
@@ -79,14 +121,37 @@ export interface RunSummary {
   levelBefore: number;
   levelAfter: number;
   unlockedItems: UnlockedItem[];
+  unlockedAchievements: AchievementUnlock[];
 }
 
 export interface AdventureStageClearResult extends AdventureStageProgress {
   grade: AdventureGrade;
   isNewBest: boolean;
+  unlockedAchievements: AchievementUnlock[];
+}
+
+export interface UnlockStats {
+  storyVictories: number;
+  maruBossClears: number;
+  lowHpVictories: number;
+}
+
+export interface AchievementStats {
+  noMissStageClears: number;
+  bossPosePerfectCounters: number;
+  rioFastClears: number;
+  maruShieldDamageAbsorbed: number;
+  neonMarkedKills: number;
+  cookieSlimesSummoned: number;
+  survivalTenMinuteClears: number;
+  defeatedBossTypes: BossType[];
 }
 
 export interface ProgressSnapshot {
+  tutorialCompleted: boolean;
+  unlockStats: UnlockStats;
+  achievementStats: AchievementStats;
+  achievements: Record<AchievementId, AchievementProgress>;
   characters: Record<CharacterId, CharacterProgress>;
   skills: Record<string, SkillProgress>;
   unlockedCoreIds: CoreId[];
@@ -373,6 +438,41 @@ export const NOISE_CODEX: NoiseCodexEntry[] = [
     description: "느리지만 오래 버팁니다. 게이지를 채운 뒤 강한 포즈 스킬로 정리하는 편이 좋습니다."
   },
   {
+    enemyType: "castBreaker",
+    title: "캐스트 브레이커",
+    role: "시전 방해",
+    weakness: "선제 처치, 대시 거리 조절",
+    description: "포즈를 준비하는 순간 속도를 올려 달려듭니다. 닿으면 캐스팅을 끊으니 스킬 버튼을 누르기 전에 먼저 밀어내세요."
+  },
+  {
+    enemyType: "shieldNoise",
+    title: "실드 노이즈",
+    role: "정면 방어",
+    weakness: "후방 공격, 측면 이동, 장판",
+    description: "항상 플레이어 쪽으로 방패면을 돌립니다. 정면 공격은 크게 줄어드니 장판을 깔거나 대시로 각도를 바꾸는 편이 좋습니다."
+  },
+  {
+    enemyType: "anchorNoise",
+    title: "앵커 노이즈",
+    role: "지역 봉쇄",
+    weakness: "빠른 접근, 원거리 폭딜",
+    description: "플레이어 발밑 주변에 둔화 장판을 고정합니다. 오래 방치하면 좋은 캐스팅 위치가 점점 사라집니다."
+  },
+  {
+    enemyType: "medicNoise",
+    title: "메딕 노이즈",
+    role: "지원 회복",
+    weakness: "우선 처치, 표식 집중",
+    description: "주변 노이즈를 조금씩 수리합니다. 탱커나 실드 노이즈 뒤에 숨어 있으면 전투가 길어집니다."
+  },
+  {
+    enemyType: "bombNoise",
+    title: "봄 노이즈",
+    role: "자폭 압박",
+    weakness: "원거리 처치, 넉백",
+    description: "가까워지거나 처치될 때 폭발합니다. 무리를 향해 터뜨리면 위험이 기회로 바뀝니다."
+  },
+  {
     enemyType: "drum",
     title: "드럼 노이즈",
     role: "1지역 보스",
@@ -395,26 +495,149 @@ export const NOISE_CODEX: NoiseCodexEntry[] = [
   }
 ];
 
-const DAILY_POOL: Omit<DailyChallenge, "dateKey">[] = [
+export const DEFAULT_DAILY_MODIFIERS: DailyChallengeModifiers = {
+  playerHpMultiplier: 1,
+  startingGauge: 82,
+  enemySpeedMultiplier: 1,
+  enemyHpMultiplier: 1,
+  enemyScoreMultiplier: 1,
+  skillCooldownMultiplier: 1,
+  perfectDamageMultiplier: 1,
+  perfectGaugeGain: 0,
+  missCooldownMultiplier: 1,
+  killGaugeMultiplier: 1,
+  dashCooldownMultiplier: 1,
+  dashSkillDamageBonus: 0,
+  swarmSpawnBonus: 0,
+  areaDamageMultiplier: 1,
+  bossHpMultiplier: 1,
+  bossScoreMultiplier: 1,
+  oneHandSkillDamageMultiplier: 1,
+  randomCore: false,
+  mirrorZeroSpawnBonus: 0
+};
+
+type DailyChallengeSeed = Omit<DailyChallenge, "dateKey" | "modifiers"> & {
+  modifiers: Partial<DailyChallengeModifiers>;
+};
+
+const DAILY_POOL: DailyChallengeSeed[] = [
   {
     id: "accelerated-noise",
     title: "가속 노이즈",
-    description: "적 이동 속도가 상승하지만 처치 보상이 조금 더 커집니다."
+    description: "적 이동 속도가 상승하지만 처치 점수가 크게 증가합니다.",
+    modifiers: {
+      enemySpeedMultiplier: 1.18,
+      enemyScoreMultiplier: 1.25
+    }
   },
   {
     id: "perfect-surge",
     title: "퍼펙트 서지",
-    description: "Perfect Cast를 성공하면 코어 게이지가 추가로 차오릅니다."
+    description: "Perfect Cast가 더 강해지고 코어 게이지를 추가로 회복합니다.",
+    modifiers: {
+      perfectDamageMultiplier: 1.12,
+      perfectGaugeGain: 12
+    }
   },
   {
     id: "unstable-core",
     title: "불안정 코어",
-    description: "스킬 쿨타임이 길어지는 대신 게이지 회복량이 증가합니다."
+    description: "스킬 쿨타임이 길어지는 대신 적 처치 게이지 회복량이 증가합니다.",
+    modifiers: {
+      skillCooldownMultiplier: 1.15,
+      killGaugeMultiplier: 1.35
+    }
   },
   {
     id: "close-call",
     title: "아슬아슬 배달",
-    description: "시작 체력이 낮아지지만 대시 후 스킬 피해량이 증가합니다."
+    description: "시작 체력이 낮아지지만 대시 후 스킬 피해량이 증가합니다.",
+    modifiers: {
+      playerHpMultiplier: 0.78,
+      dashSkillDamageBonus: 0.35,
+      enemyScoreMultiplier: 1.12
+    }
+  },
+  {
+    id: "pose-master",
+    title: "포즈 마스터",
+    description: "Perfect Cast 피해가 크게 증가하지만 Miss 쿨타임 패널티도 커집니다.",
+    modifiers: {
+      perfectDamageMultiplier: 1.35,
+      missCooldownMultiplier: 1.45,
+      enemyScoreMultiplier: 1.18
+    }
+  },
+  {
+    id: "no-gauge-start",
+    title: "노 게이지 스타트",
+    description: "코어 게이지 0으로 시작하지만 적 처치 게이지 회복량이 크게 증가합니다.",
+    modifiers: {
+      startingGauge: 0,
+      killGaugeMultiplier: 1.75,
+      enemyScoreMultiplier: 1.16
+    }
+  },
+  {
+    id: "swarm-party",
+    title: "스웜 파티",
+    description: "스웜이 더 많이 등장하지만 광역 스킬 피해가 증가합니다.",
+    modifiers: {
+      swarmSpawnBonus: 0.36,
+      areaDamageMultiplier: 1.25,
+      enemyScoreMultiplier: 1.12
+    }
+  },
+  {
+    id: "boss-rush-day",
+    title: "보스 러시 데이",
+    description: "보스 체력이 증가하지만 보스 처치 점수가 크게 증가합니다.",
+    modifiers: {
+      bossHpMultiplier: 1.25,
+      bossScoreMultiplier: 1.7,
+      perfectDamageMultiplier: 1.08
+    }
+  },
+  {
+    id: "one-hand-caster",
+    title: "원 핸드 캐스터",
+    description: "한 손 제스처 스킬이 강화되지만 전체 쿨타임이 약간 길어집니다.",
+    modifiers: {
+      oneHandSkillDamageMultiplier: 1.28,
+      skillCooldownMultiplier: 1.06,
+      enemyScoreMultiplier: 1.1
+    }
+  },
+  {
+    id: "random-core",
+    title: "랜덤 코어",
+    description: "매 판 임의의 모션 코어를 장착하고 처치 점수 보너스를 얻습니다.",
+    modifiers: {
+      randomCore: true,
+      enemyScoreMultiplier: 1.18
+    }
+  },
+  {
+    id: "moving-day",
+    title: "무빙 데이",
+    description: "대시 쿨타임이 짧아지지만 적 이동 속도도 상승합니다.",
+    modifiers: {
+      dashCooldownMultiplier: 0.72,
+      enemySpeedMultiplier: 1.16,
+      dashSkillDamageBonus: 0.2,
+      enemyScoreMultiplier: 1.12
+    }
+  },
+  {
+    id: "glitch-day",
+    title: "글리치 데이",
+    description: "미러/제로 계열 방해 적이 늘어나지만 처치 점수가 증가합니다.",
+    modifiers: {
+      mirrorZeroSpawnBonus: 0.38,
+      enemyScoreMultiplier: 1.22,
+      missCooldownMultiplier: 1.12
+    }
   }
 ];
 
@@ -422,11 +645,13 @@ export class ProgressionStore {
   private snapshot: ProgressSnapshot;
   private listeners = new Set<(snapshot: ProgressSnapshot) => void>();
   private pendingUnlockedItems: UnlockedItem[] = [];
+  private pendingAchievementUnlocks: AchievementUnlock[] = [];
 
   constructor() {
     this.snapshot = this.load();
-    if (this.evaluateUnlocks().length > 0) {
+    if (this.evaluateAchievements().length > 0 || this.evaluateUnlocks().length > 0) {
       this.pendingUnlockedItems = [];
+      this.pendingAchievementUnlocks = [];
       this.save();
     }
   }
@@ -473,12 +698,14 @@ export class ProgressionStore {
     this.save();
   }
 
-  recordEnemySeen(enemyType: EnemyType): void {
+  recordEnemySeen(enemyType: EnemyType): AchievementUnlock[] {
     if (enemyType === "dummy" || this.snapshot.discoveredEnemyTypes.includes(enemyType)) {
-      return;
+      return [];
     }
     this.snapshot.discoveredEnemyTypes.push(enemyType);
+    this.evaluateProgression();
     this.save();
+    return this.drainUnlockedAchievements();
   }
 
   getSelectedAdventureStageIndex(): number {
@@ -518,7 +745,7 @@ export class ProgressionStore {
     return true;
   }
 
-  recordAdventureStageClear(input: { stageId: string; score: number; seconds: number; hpRatio: number }): AdventureStageClearResult {
+  recordAdventureStageClear(input: { stageId: string; score: number; seconds: number; hpRatio: number; misses?: number }): AdventureStageClearResult {
     const current = this.snapshot.adventureStages[input.stageId] ?? createDefaultAdventureStageProgress();
     const grade = calculateAdventureGrade(input.score, input.seconds, input.hpRatio);
     const currentRank = gradeRank(current.bestGrade);
@@ -542,12 +769,15 @@ export class ProgressionStore {
       this.snapshot.selectedAdventureStageId = nextStage.id;
     }
 
-    this.evaluateUnlocks();
+    if ((input.misses ?? 0) === 0) {
+      this.snapshot.achievementStats.noMissStageClears += 1;
+    }
+    this.evaluateProgression();
     this.save();
-    return { ...nextProgress, grade, isNewBest };
+    return { ...nextProgress, grade, isNewBest, unlockedAchievements: this.drainUnlockedAchievements() };
   }
 
-  recordCast(characterId: CharacterId, skillId: string, grade: CastGrade): void {
+  recordCast(characterId: CharacterId, skillId: string, grade: CastGrade): AchievementUnlock[] {
     const character = this.snapshot.characters[characterId];
     const skill = this.snapshot.skills[skillId] ?? { uses: 0, perfects: 0, level: 1 };
     skill.uses += 1;
@@ -557,15 +787,32 @@ export class ProgressionStore {
     }
     skill.level = calculateSkillLevel(skill.uses, skill.perfects);
     this.snapshot.skills[skillId] = skill;
-    this.evaluateUnlocks();
+    this.evaluateProgression();
     this.save();
+    return this.drainUnlockedAchievements();
   }
 
-  recordRun(input: { characterId: CharacterId; mode: GameMode; victory: boolean; score: number; seconds: number; hpRatio: number; bossClear: boolean }): RunSummary {
+  recordRun(input: {
+    characterId: CharacterId;
+    mode: GameMode;
+    victory: boolean;
+    score: number;
+    seconds: number;
+    hpRatio: number;
+    bossClear: boolean;
+    misses?: number;
+    bossPosePerfectCounters?: number;
+    shieldDamageAbsorbed?: number;
+    markedEnemyKills?: number;
+    slimesSummoned?: number;
+    bossesDefeated?: BossType[];
+  }): RunSummary {
     const character = this.snapshot.characters[input.characterId];
     const levelBefore = character.level;
     const modeBonus =
-      input.mode === "adventure"
+      input.mode === "tutorial"
+        ? 20
+        : input.mode === "adventure"
         ? 95
         : input.mode === "boss-rush"
           ? 70
@@ -577,14 +824,83 @@ export class ProgressionStore {
     character.runs += 1;
     if (input.victory) {
       character.victories += 1;
+      if (input.mode === "story") {
+        this.snapshot.unlockStats.storyVictories += 1;
+      }
+      if (input.characterId === "maru" && input.bossClear) {
+        this.snapshot.unlockStats.maruBossClears += 1;
+      }
+      if (input.hpRatio <= 0.4) {
+        this.snapshot.unlockStats.lowHpVictories += 1;
+      }
+      if (input.mode !== "adventure" && input.mode !== "tutorial" && (input.misses ?? 0) === 0) {
+        this.snapshot.achievementStats.noMissStageClears += 1;
+      }
+      if (input.characterId === "rio" && input.seconds <= 300) {
+        this.snapshot.achievementStats.rioFastClears += 1;
+      }
+      if (input.mode === "survival" && input.seconds >= 600) {
+        this.snapshot.achievementStats.survivalTenMinuteClears += 1;
+      }
     }
+    this.snapshot.achievementStats.bossPosePerfectCounters += input.bossPosePerfectCounters ?? 0;
+    if (input.characterId === "maru") {
+      this.snapshot.achievementStats.maruShieldDamageAbsorbed += Math.max(0, Math.round(input.shieldDamageAbsorbed ?? 0));
+    }
+    if (input.characterId === "neon") {
+      this.snapshot.achievementStats.neonMarkedKills += Math.max(0, Math.round(input.markedEnemyKills ?? 0));
+    }
+    if (input.characterId === "cookie") {
+      this.snapshot.achievementStats.cookieSlimesSummoned += Math.max(0, Math.round(input.slimesSummoned ?? 0));
+    }
+    this.snapshot.achievementStats.defeatedBossTypes = Array.from(
+      new Set([...this.snapshot.achievementStats.defeatedBossTypes, ...(input.bossesDefeated ?? [])])
+    );
     character.level = calculateCharacterLevel(character.xp);
-    this.evaluateUnlocks(input);
+    this.evaluateProgression(input);
     this.save();
-    return { xpGained, levelBefore, levelAfter: character.level, unlockedItems: this.drainUnlockedItems() };
+    return {
+      xpGained,
+      levelBefore,
+      levelAfter: character.level,
+      unlockedItems: this.drainUnlockedItems(),
+      unlockedAchievements: this.drainUnlockedAchievements()
+    };
   }
 
-  evaluateUnlocks(context: Partial<{ characterId: CharacterId; mode: GameMode; victory: boolean; hpRatio: number; bossClear: boolean }> = {}): UnlockedItem[] {
+  markTutorialCompleted(): void {
+    if (this.snapshot.tutorialCompleted) {
+      return;
+    }
+    this.snapshot.tutorialCompleted = true;
+    this.save();
+  }
+
+  evaluateProgression(context: Partial<{ characterId: CharacterId; mode: GameMode; victory: boolean; hpRatio: number; bossClear: boolean }> = {}): void {
+    this.evaluateAchievements();
+    this.evaluateUnlocks(context);
+    this.evaluateAchievements();
+  }
+
+  evaluateAchievements(): AchievementUnlock[] {
+    const unlocked: AchievementUnlock[] = [];
+    for (const definition of ACHIEVEMENTS) {
+      const view = getAchievementProgress(this.snapshot, definition);
+      const current = this.snapshot.achievements[definition.id] ?? { current: 0, completed: false, completedAt: null };
+      current.current = view.current;
+      if (!current.completed && view.completed) {
+        current.completed = true;
+        current.completedAt = Date.now();
+        const unlock = createAchievementUnlock(definition);
+        unlocked.push(unlock);
+        this.pendingAchievementUnlocks.push(unlock);
+      }
+      this.snapshot.achievements[definition.id] = current;
+    }
+    return unlocked;
+  }
+
+  evaluateUnlocks(_context: Partial<{ characterId: CharacterId; mode: GameMode; victory: boolean; hpRatio: number; bossClear: boolean }> = {}): UnlockedItem[] {
     const unlocked: UnlockedItem[] = [];
     const addUnlock = (item: UnlockedItem) => {
       unlocked.push(item);
@@ -615,44 +931,16 @@ export class ProgressionStore {
       addUnlock({ type: "effect", id: paletteId, title: palette.title, description: palette.description });
     };
 
-    const totalPerfectCasts = Object.values(this.snapshot.characters).reduce((sum, character) => sum + character.perfectCasts, 0);
-    const sameSkillMastered = Object.values(this.snapshot.skills).some((skill) => skill.uses >= 50);
-    const sRankStages = Object.values(this.snapshot.adventureStages).filter((stage) => stage.bestGrade === "S").length;
-
-    if (context.mode === "story" && context.victory) {
-      unlockCore("echo-core");
-    }
-    if (totalPerfectCasts >= 30) {
-      unlockCore("rhythm-core");
-    }
-    if (context.characterId === "maru" && context.victory && context.bossClear) {
-      unlockCore("guard-core");
-    }
-    if (context.victory && (context.hpRatio ?? 1) <= 0.4) {
-      unlockCore("rampage-core");
-    }
-    if (sameSkillMastered) {
-      unlockCore("focus-core");
-    }
-
-    if (totalPerfectCasts >= 100) {
-      unlockPalette("neon-pop");
-    }
-    if (sRankStages >= 3) {
-      unlockPalette("gold-rush");
-    }
-    if (this.snapshot.characters.cookie.level >= 5) {
-      unlockPalette("slime-soda");
-    }
-
-    for (const characterId of CHARACTER_ORDER) {
-      const progress = this.snapshot.characters[characterId];
-      const skins = getSkinsForCharacter(characterId).filter((skin) => skin.id !== getDefaultSkinId(characterId));
-      if (progress.level >= 2 && skins[0]) {
-        unlockSkin(skins[0].id);
+    for (const definition of UNLOCK_CONDITIONS) {
+      if (!isUnlockConditionMet(this.snapshot, definition)) {
+        continue;
       }
-      if (progress.level >= 5 && skins[1]) {
-        unlockSkin(skins[1].id);
+      if (definition.itemType === "core") {
+        unlockCore(definition.itemId as CoreId);
+      } else if (definition.itemType === "skin") {
+        unlockSkin(definition.itemId as CharacterSkinId);
+      } else {
+        unlockPalette(definition.itemId as EffectPaletteId);
       }
     }
 
@@ -663,6 +951,12 @@ export class ProgressionStore {
     const items = this.pendingUnlockedItems;
     this.pendingUnlockedItems = [];
     return items;
+  }
+
+  private drainUnlockedAchievements(): AchievementUnlock[] {
+    const achievements = this.pendingAchievementUnlocks;
+    this.pendingAchievementUnlocks = [];
+    return achievements;
   }
 
   subscribe(listener: (snapshot: ProgressSnapshot) => void): () => void {
@@ -761,6 +1055,14 @@ function createDefaultSnapshot(): ProgressSnapshot {
   }
 
   return {
+    tutorialCompleted: false,
+    unlockStats: {
+      storyVictories: 0,
+      maruBossClears: 0,
+      lowHpVictories: 0
+    },
+    achievementStats: createDefaultAchievementStats(),
+    achievements: createDefaultAchievementProgress(),
     characters,
     skills,
     unlockedCoreIds: [...defaultUnlockedCoreIds],
@@ -829,9 +1131,19 @@ function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
     typeof input.selectedAdventureStageId === "string" && ADVENTURE_STAGES.some((stage) => stage.id === input.selectedAdventureStageId)
       ? input.selectedAdventureStageId
       : fallback.selectedAdventureStageId;
+  const unlockStats = {
+    storyVictories: Math.max(0, Math.floor(input.unlockStats?.storyVictories ?? fallback.unlockStats.storyVictories)),
+    maruBossClears: Math.max(0, Math.floor(input.unlockStats?.maruBossClears ?? fallback.unlockStats.maruBossClears)),
+    lowHpVictories: Math.max(0, Math.floor(input.unlockStats?.lowHpVictories ?? fallback.unlockStats.lowHpVictories))
+  };
+  const achievementStats = normalizeAchievementStats(input.achievementStats);
   const normalized = {
     ...fallback,
     ...input,
+    tutorialCompleted: Boolean(input.tutorialCompleted),
+    unlockStats,
+    achievementStats,
+    achievements: normalizeAchievementProgress(input.achievements),
     characters: { ...fallback.characters, ...input.characters },
     skills: { ...fallback.skills, ...input.skills },
     unlockedCoreIds,
@@ -843,7 +1155,7 @@ function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
     discoveredEnemyTypes,
     selectedAdventureStageId,
     adventureStages,
-    daily: input.daily?.dateKey === createDateKey() ? input.daily : createDailyChallenge()
+    daily: normalizeDailyChallenge(input.daily)
   };
 
   for (const characterId of CHARACTER_ORDER) {
@@ -854,8 +1166,80 @@ function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
     const progress = normalized.skills[skillId];
     progress.level = calculateSkillLevel(progress.uses, progress.perfects);
   });
+  syncAchievementProgress(normalized);
 
   return normalized;
+}
+
+function createDefaultAchievementStats(): AchievementStats {
+  return {
+    noMissStageClears: 0,
+    bossPosePerfectCounters: 0,
+    rioFastClears: 0,
+    maruShieldDamageAbsorbed: 0,
+    neonMarkedKills: 0,
+    cookieSlimesSummoned: 0,
+    survivalTenMinuteClears: 0,
+    defeatedBossTypes: []
+  };
+}
+
+function createDefaultAchievementProgress(): Record<AchievementId, AchievementProgress> {
+  return Object.fromEntries(
+    ACHIEVEMENTS.map((achievement) => [
+      achievement.id,
+      {
+        current: 0,
+        completed: false,
+        completedAt: null
+      }
+    ])
+  ) as Record<AchievementId, AchievementProgress>;
+}
+
+function normalizeAchievementStats(input?: Partial<AchievementStats>): AchievementStats {
+  const fallback = createDefaultAchievementStats();
+  return {
+    noMissStageClears: Math.max(0, Math.floor(input?.noMissStageClears ?? fallback.noMissStageClears)),
+    bossPosePerfectCounters: Math.max(0, Math.floor(input?.bossPosePerfectCounters ?? fallback.bossPosePerfectCounters)),
+    rioFastClears: Math.max(0, Math.floor(input?.rioFastClears ?? fallback.rioFastClears)),
+    maruShieldDamageAbsorbed: Math.max(0, Math.floor(input?.maruShieldDamageAbsorbed ?? fallback.maruShieldDamageAbsorbed)),
+    neonMarkedKills: Math.max(0, Math.floor(input?.neonMarkedKills ?? fallback.neonMarkedKills)),
+    cookieSlimesSummoned: Math.max(0, Math.floor(input?.cookieSlimesSummoned ?? fallback.cookieSlimesSummoned)),
+    survivalTenMinuteClears: Math.max(0, Math.floor(input?.survivalTenMinuteClears ?? fallback.survivalTenMinuteClears)),
+    defeatedBossTypes: Array.from(
+      new Set((input?.defeatedBossTypes ?? fallback.defeatedBossTypes).filter((boss): boss is BossType => boss === "drum" || boss === "mirror" || boss === "zero"))
+    )
+  };
+}
+
+function normalizeAchievementProgress(input?: Partial<Record<AchievementId, Partial<AchievementProgress>>>): Record<AchievementId, AchievementProgress> {
+  const achievements = createDefaultAchievementProgress();
+  for (const definition of ACHIEVEMENTS) {
+    const current = input?.[definition.id];
+    if (!current) {
+      continue;
+    }
+    achievements[definition.id] = {
+      current: Math.max(0, Math.floor(current.current ?? 0)),
+      completed: Boolean(current.completed),
+      completedAt: typeof current.completedAt === "number" ? current.completedAt : null
+    };
+  }
+  return achievements;
+}
+
+function syncAchievementProgress(snapshot: ProgressSnapshot): void {
+  for (const definition of ACHIEVEMENTS) {
+    const view = getAchievementProgress(snapshot, definition);
+    const current = snapshot.achievements[definition.id] ?? { current: 0, completed: false, completedAt: null };
+    current.current = view.current;
+    if (view.completed && !current.completed) {
+      current.completed = true;
+      current.completedAt = Date.now();
+    }
+    snapshot.achievements[definition.id] = current;
+  }
 }
 
 function createDefaultAdventureStageProgress(): AdventureStageProgress {
@@ -928,10 +1312,108 @@ function gradeRank(grade: AdventureGrade | null): number {
   return 0;
 }
 
+export function describeDailyModifiers(modifiers: DailyChallengeModifiers): string[] {
+  const lines: string[] = [];
+  if (modifiers.playerHpMultiplier !== 1) {
+    lines.push(`시작 체력 ${Math.round(modifiers.playerHpMultiplier * 100)}%`);
+  }
+  if (modifiers.startingGauge !== DEFAULT_DAILY_MODIFIERS.startingGauge) {
+    lines.push(`시작 게이지 ${modifiers.startingGauge}%`);
+  }
+  if (modifiers.enemySpeedMultiplier !== 1) {
+    lines.push(`적 이동 속도 x${formatModifier(modifiers.enemySpeedMultiplier)}`);
+  }
+  if (modifiers.enemyHpMultiplier !== 1) {
+    lines.push(`일반 적 체력 x${formatModifier(modifiers.enemyHpMultiplier)}`);
+  }
+  if (modifiers.skillCooldownMultiplier !== 1) {
+    lines.push(`스킬 쿨타임 x${formatModifier(modifiers.skillCooldownMultiplier)}`);
+  }
+  if (modifiers.perfectDamageMultiplier !== 1) {
+    lines.push(`Perfect 스킬 피해 x${formatModifier(modifiers.perfectDamageMultiplier)}`);
+  }
+  if (modifiers.perfectGaugeGain > 0) {
+    lines.push(`Perfect 시 게이지 +${modifiers.perfectGaugeGain}`);
+  }
+  if (modifiers.missCooldownMultiplier !== 1) {
+    lines.push(`Miss 쿨타임 패널티 x${formatModifier(modifiers.missCooldownMultiplier)}`);
+  }
+  if (modifiers.killGaugeMultiplier !== 1) {
+    lines.push(`처치 게이지 회복 x${formatModifier(modifiers.killGaugeMultiplier)}`);
+  }
+  if (modifiers.dashCooldownMultiplier !== 1) {
+    lines.push(`대시 쿨타임 x${formatModifier(modifiers.dashCooldownMultiplier)}`);
+  }
+  if (modifiers.dashSkillDamageBonus > 0) {
+    lines.push(`대시 후 스킬 피해 +${Math.round(modifiers.dashSkillDamageBonus * 100)}%`);
+  }
+  if (modifiers.swarmSpawnBonus > 0) {
+    lines.push(`스웜 추가 출현 +${Math.round(modifiers.swarmSpawnBonus * 100)}%`);
+  }
+  if (modifiers.areaDamageMultiplier !== 1) {
+    lines.push(`광역 스킬 범위/피해 x${formatModifier(modifiers.areaDamageMultiplier)}`);
+  }
+  if (modifiers.bossHpMultiplier !== 1) {
+    lines.push(`보스 체력 x${formatModifier(modifiers.bossHpMultiplier)}`);
+  }
+  if (modifiers.bossScoreMultiplier !== 1) {
+    lines.push(`보스 처치 점수 x${formatModifier(modifiers.bossScoreMultiplier)}`);
+  }
+  if (modifiers.oneHandSkillDamageMultiplier !== 1) {
+    lines.push(`한 손 제스처 스킬 피해 x${formatModifier(modifiers.oneHandSkillDamageMultiplier)}`);
+  }
+  if (modifiers.randomCore) {
+    lines.push("매 판 랜덤 코어 장착");
+  }
+  if (modifiers.mirrorZeroSpawnBonus > 0) {
+    lines.push(`방해형 노이즈 추가 출현 +${Math.round(modifiers.mirrorZeroSpawnBonus * 100)}%`);
+  }
+  if (modifiers.enemyScoreMultiplier !== 1) {
+    lines.push(`일반 처치 점수 x${formatModifier(modifiers.enemyScoreMultiplier)}`);
+  }
+  return lines;
+}
+
 function createDailyChallenge(date = new Date()): DailyChallenge {
   const dateKey = createDateKey(date);
   const index = hashText(dateKey) % DAILY_POOL.length;
-  return { ...DAILY_POOL[index], dateKey };
+  return createDailyFromSeed(DAILY_POOL[index], dateKey);
+}
+
+function createDailyFromSeed(seed: DailyChallengeSeed, dateKey: string): DailyChallenge {
+  return {
+    id: seed.id,
+    title: seed.title,
+    description: seed.description,
+    dateKey,
+    modifiers: {
+      ...DEFAULT_DAILY_MODIFIERS,
+      ...seed.modifiers
+    }
+  };
+}
+
+function normalizeDailyChallenge(input?: Partial<DailyChallenge>): DailyChallenge {
+  const dateKey = createDateKey();
+  if (input?.dateKey !== dateKey) {
+    return createDailyChallenge();
+  }
+
+  const seed = DAILY_POOL.find((challenge) => challenge.id === input.id);
+  const base = seed ? createDailyFromSeed(seed, dateKey) : createDailyChallenge();
+  return {
+    ...base,
+    title: input.title ?? base.title,
+    description: input.description ?? base.description,
+    modifiers: {
+      ...base.modifiers,
+      ...(input.modifiers ?? {})
+    }
+  };
+}
+
+function formatModifier(value: number): string {
+  return value.toFixed(2).replace(/\.?0+$/, "");
 }
 
 function createDateKey(date = new Date()): string {

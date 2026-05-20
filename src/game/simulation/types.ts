@@ -1,7 +1,7 @@
 import type { SkillSlot } from "../input/actions";
 
 export type CharacterId = "rio" | "maru" | "neon" | "cookie";
-export type GameMode = "story" | "adventure" | "survival" | "boss-rush" | "training";
+export type GameMode = "tutorial" | "story" | "adventure" | "survival" | "boss-rush" | "training";
 export type CoreId = "echo-core" | "rhythm-core" | "guard-core" | "rampage-core" | "stability-core" | "focus-core";
 export type CharacterSkinId =
   | "rio-default"
@@ -17,6 +17,18 @@ export type CharacterSkinId =
   | "cookie-patissier"
   | "cookie-witch";
 export type EffectPaletteId = "classic" | "neon-pop" | "gold-rush" | "slime-soda";
+export type AchievementId =
+  | "perfect-cast-10"
+  | "perfect-cast-100"
+  | "no-miss-stage-clear"
+  | "boss-pose-perfect"
+  | "rio-fast-clear"
+  | "maru-shield-300"
+  | "neon-marked-100"
+  | "cookie-slime-100"
+  | "survival-10"
+  | "all-bosses"
+  | "all-cores";
 export type GestureId =
   | "slash"
   | "thrust"
@@ -32,11 +44,54 @@ export type GestureId =
   | "heart"
   | "focus-triangle";
 export type CastGrade = "Miss" | "Normal" | "Great" | "Perfect";
-export type EnemyType = "runner" | "shooter" | "swarm" | "tank" | "drum" | "mirror" | "zero" | "dummy";
+export type EnemyType =
+  | "runner"
+  | "shooter"
+  | "swarm"
+  | "tank"
+  | "castBreaker"
+  | "shieldNoise"
+  | "anchorNoise"
+  | "medicNoise"
+  | "bombNoise"
+  | "drum"
+  | "mirror"
+  | "zero"
+  | "dummy";
 export type BossType = "drum" | "mirror" | "zero";
 export type ProjectileOwner = "player" | "enemy";
-export type SoundId = "prepare" | "normal" | "great" | "perfect" | "dash" | "hit" | "enemy-down" | "reward" | "boss";
+export type SoundId =
+  | "prepare"
+  | "normal"
+  | "great"
+  | "perfect"
+  | "dash"
+  | "hit"
+  | "enemy-down"
+  | "reward"
+  | "boss"
+  | "cast-start"
+  | "cast-normal"
+  | "cast-great"
+  | "cast-perfect"
+  | "rio-skill"
+  | "maru-skill"
+  | "neon-skill"
+  | "cookie-skill"
+  | "boss-break-start"
+  | "boss-break-success"
+  | "boss-break-fail"
+  | "reward-common"
+  | "reward-uncommon"
+  | "reward-rare"
+  | "reward-epic"
+  | "reward-legendary"
+  | "unlock"
+  | "phase-change"
+  | "build-complete";
 export type UnlockItemType = "core" | "skin" | "effect";
+export type StageRegion = "루프시티" | "놀이공원" | "미러 타워" | "제로 존" | "훈련장" | "보스 러시";
+export type StageHazardKind = "rotator" | "mirror-reversal" | "stasis-drain";
 
 export interface UnlockedItem {
   type: UnlockItemType;
@@ -45,12 +100,29 @@ export interface UnlockedItem {
   description: string;
 }
 
+export interface AchievementUnlock {
+  id: AchievementId;
+  title: string;
+  description: string;
+  rewardDescription?: string;
+}
+
 export interface GestureResult {
   gestureId: GestureId;
   score: number;
   grade: CastGrade;
   confidence: number;
   reason: string;
+  breakdown?: GestureScoreBreakdown;
+}
+
+export interface GestureScoreBreakdown {
+  positionScore: number;
+  motionScore: number;
+  speedScore: number;
+  stabilityScore: number;
+  sizeScore: number;
+  tip: string;
 }
 
 export interface Vector2 {
@@ -93,6 +165,12 @@ export interface EnemyState extends Vector2 {
   hp: number;
   maxHp: number;
   speed: number;
+  facing: Vector2;
+  phase: number;
+  phaseTriggered: {
+    phase2: boolean;
+    phase3: boolean;
+  };
   shootCooldown: number;
   pulseCooldown: number;
   markedTime: number;
@@ -111,7 +189,7 @@ export interface ProjectileState extends Vector2 {
   color: number;
 }
 
-export type TrapKind = "noise-trap" | "sweet-field";
+export type TrapKind = "noise-trap" | "sweet-field" | "drum-warning";
 
 export interface TrapState extends Vector2 {
   id: number;
@@ -121,6 +199,18 @@ export interface TrapState extends Vector2 {
   ttl: number;
   pulseTimer: number;
   color: number;
+}
+
+export interface StageHazardState extends Vector2 {
+  id: number;
+  kind: StageHazardKind;
+  radius: number;
+  strength: number;
+  phase: number;
+  angle: number;
+  cooldown: number;
+  pulseTimer: number;
+  activeTime: number;
 }
 
 export type AllyKind = "slime" | "big-slime";
@@ -145,10 +235,21 @@ export interface PreparedSkillState {
 export interface BossChallengeState {
   bossType: BossType;
   requiredGesture: GestureId;
+  sequence: GestureId[];
+  currentIndex: number;
   prompt: string;
+  stepPrompts: string[];
   expiresAt: number;
-  successEffect: "drum-counter" | "mirror-shatter" | "zero-release";
+  stepDuration: number;
+  successEffect: "drum-counter" | "drum-combo-counter" | "mirror-shatter" | "mirror-prison-break" | "zero-release" | "zero-final-release";
   failDamage: number;
+}
+
+export interface ActiveSynergyState {
+  id: string;
+  title: string;
+  description: string;
+  activeEffect: string;
 }
 
 export interface RunStats {
@@ -162,9 +263,17 @@ export interface RunStats {
   skillsUsed: number;
   rewardsChosen: string[];
   unlockedItems: UnlockedItem[];
+  unlockedAchievements: AchievementUnlock[];
   xpGained: number;
   levelBefore: number;
   levelAfter: number;
+  dailyChallengeTitle: string;
+  dailyChallengeCleared: boolean;
+  bossPosePerfectCounters: number;
+  shieldDamageAbsorbed: number;
+  markedEnemyKills: number;
+  slimesSummoned: number;
+  bossesDefeated: BossType[];
 }
 
 export interface TrainingMissionState {
@@ -185,6 +294,7 @@ export interface TrainingLastResult {
   score: number;
   grade: CastGrade;
   reason: string;
+  breakdown?: GestureScoreBreakdown;
   at: number;
 }
 
@@ -192,6 +302,35 @@ export interface TrainingState {
   missions: TrainingMissionState[];
   lastResult: TrainingLastResult | null;
   completedRewardKeys: string[];
+}
+
+export type TutorialStepId =
+  | "move"
+  | "dash"
+  | "basic-attack"
+  | "prepare-q"
+  | "cast-skill"
+  | "reward"
+  | "boss-pose-break";
+
+export interface TutorialStepState {
+  id: TutorialStepId;
+  title: string;
+  prompt: string;
+  hint: string;
+  completed: boolean;
+}
+
+export interface TutorialState {
+  steps: TutorialStepState[];
+  currentStepIndex: number;
+  moveSeconds: number;
+  basicAttackHits: number;
+  skillPrepared: boolean;
+  skillCast: boolean;
+  rewardChosen: boolean;
+  bossChallengeCleared: boolean;
+  completed: boolean;
 }
 
 export interface PlayerUpgrades {
@@ -275,6 +414,7 @@ export interface GameState {
   gameOver: boolean;
   victory: boolean;
   stageName: string;
+  stageRegion: StageRegion;
   adventureStageIndex: number;
   adventureStageTotal: number;
   adventureStageCode: string;
@@ -282,10 +422,13 @@ export interface GameState {
   adventureStageEnemyTotal: number;
   adventureStageStartTime: number;
   adventureStageStartScore: number;
+  adventureStageStartMisses: number;
   activeCoreId: CoreId;
   equippedSkinId: CharacterSkinId;
   effectPaletteId: EffectPaletteId;
   dailyChallengeId: string;
+  dailyChallengeTitle: string;
+  dailyChallengeDescription: string;
   modeTime: number;
   survivalNextRewardAt: number;
   survivalFinalBossSpawned: boolean;
@@ -295,6 +438,8 @@ export interface GameState {
   spawnQueue: EnemyType[];
   spawnTimer: number;
   pendingRewardIds: string[];
+  rewardOfferHistoryIds: string[];
+  rewardRerollsRemaining: number;
   rewardStacks: Record<string, number>;
   preparedSkill: PreparedSkillState | null;
   bossChallenge: BossChallengeState | null;
@@ -302,6 +447,9 @@ export interface GameState {
   player: PlayerState;
   runStats: RunStats;
   training: TrainingState;
+  tutorial: TutorialState;
+  activeSynergies: ActiveSynergyState[];
+  stageHazards: StageHazardState[];
   enemies: EnemyState[];
   projectiles: ProjectileState[];
   traps: TrapState[];
@@ -349,6 +497,24 @@ export type FxEvent =
   | {
       kind: "shake";
       intensity: number;
+      duration: number;
+    }
+  | {
+      kind: "screen-flash";
+      color: number;
+      alpha: number;
+      duration: number;
+    }
+  | {
+      kind: "cut-in";
+      title: string;
+      subtitle?: string;
+      color: number;
+      duration: number;
+    }
+  | {
+      kind: "zoom-pulse";
+      zoom: number;
       duration: number;
     };
 

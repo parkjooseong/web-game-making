@@ -1,4 +1,5 @@
 import "./styles.css";
+import { isSoundEnabled, toggleSoundEnabled } from "./game/audio/audioSettings";
 import { ProgressionStore } from "./game/progression/progression";
 import { GameSimulation } from "./game/simulation/GameSimulation";
 import { PoseService } from "./game/pose/PoseService";
@@ -15,6 +16,7 @@ const hud = new Hud({
     hud.setCameraStatus(poseService.getStatus());
   },
   onRewardSelected: (rewardId) => simulation.chooseReward(rewardId),
+  onRewardReroll: () => simulation.rerollRewards(),
   onRestart: () => simulation.reset(),
   onCharacterSelected: (characterId) => simulation.switchCharacter(characterId),
   onModeSelected: (mode) => simulation.setMode(mode),
@@ -42,6 +44,8 @@ const hud = new Hud({
       hud.showToast("아직 잠긴 단계입니다.");
     }
   },
+  isSoundEnabled,
+  onSoundToggled: () => toggleSoundEnabled().soundEnabled,
   progression
 });
 

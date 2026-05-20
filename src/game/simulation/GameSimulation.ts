@@ -1,14 +1,21 @@
-import { REWARDS, getRewardDefinition, type RewardDefinition, type RewardRarity } from "../content/rewards";
 import { ADVENTURE_STAGES } from "../content/adventure";
 import { CHARACTER_ORDER, getCharacter, getSkillsForCharacter } from "../content/skills";
+import { calculateActiveSynergies } from "../content/synergies";
 import { createTrainingState } from "../content/training";
+import { createTutorialState } from "../content/tutorial";
 import type { MoveInput, SkillSlot } from "../input/actions";
-import { getDefaultSkinId } from "../progression/progression";
+import { CORES, DEFAULT_DAILY_MODIFIERS, getDefaultSkinId, type DailyChallengeModifiers } from "../progression/progression";
 import type { ProgressionStore } from "../progression/progression";
+import { BossSystem, getCurrentBossChallengeGesture, type BossChallengeConfig } from "./systems/bossSystem";
+import type { DamageEnemyOptions } from "./systems/combatTypes";
+import { contactDamageForEnemy, enemyStats, gaugeForEnemy, isBossEnemy, makeSurvivalWave, scoreForEnemy } from "./systems/enemySystem";
+import { applyReward as applyRewardToState, rewardSoundForRarity, rollRewards as rollRewardsForState } from "./systems/rewardSystem";
+import { castTrainingDebugGrade, debugBreakdown, getNextTrainingGesture, recordTrainingGestureResult } from "./systems/trainingSystem";
 import type {
   CastGrade,
   CastResponse,
   AllyState,
+  AchievementUnlock,
   BossChallengeState,
   CharacterId,
   EnemyState,
@@ -19,6 +26,10 @@ import type {
   GestureResult,
   ProjectileState,
   SimulationInput,
+  SoundId,
+  StageHazardState,
+  StageRegion,
+  TutorialStepId,
   TrapState,
   Vector2
 } from "./types";
@@ -29,10 +40,10 @@ export const WORLD_HEIGHT = 1400;
 
 const wavePlans: EnemyType[][] = [
   ["runner", "runner", "runner", "runner", "swarm", "swarm", "shooter"],
-  ["runner", "runner", "runner", "swarm", "swarm", "swarm", "shooter", "tank"],
-  ["runner", "runner", "runner", "runner", "swarm", "swarm", "shooter", "shooter", "tank"],
-  ["runner", "runner", "swarm", "swarm", "swarm", "shooter", "shooter", "tank", "tank"],
-  ["runner", "runner", "swarm", "swarm", "shooter", "tank", "drum"]
+  ["runner", "runner", "runner", "swarm", "swarm", "swarm", "shooter", "castBreaker"],
+  ["runner", "runner", "swarm", "swarm", "shooter", "shooter", "shieldNoise", "tank"],
+  ["runner", "swarm", "swarm", "shooter", "tank", "anchorNoise", "medicNoise", "bombNoise"],
+  ["runner", "swarm", "shooter", "shieldNoise", "anchorNoise", "medicNoise", "bombNoise", "drum"]
 ];
 
 const bossRushPlan: EnemyType[] = ["drum", "mirror", "zero"];
@@ -44,8 +55,24 @@ export class GameSimulation {
   private selectedCharacterId: CharacterId = "rio";
   private selectedMode: GameMode = "story";
   private runReported = false;
+  private dailyModifiers: DailyChallengeModifiers = { ...DEFAULT_DAILY_MODIFIERS };
+  private readonly bossSystem: BossSystem;
 
   constructor(private readonly progression?: ProgressionStore) {
+    this.bossSystem = new BossSystem({
+      getState: () => this.state,
+      pushFx: (event) => this.fxEvents.push(event),
+      damageEnemy: (enemy, amount, color, options) => this.damageEnemy(enemy, amount, color, options),
+      damagePlayer: (amount) => this.damagePlayer(amount),
+      fireZeroMotionPulse: (enemy) => this.fireZeroMotionPulse(enemy),
+      pushCutIn: (title, subtitle, color, duration) => this.pushCutIn(title, subtitle, color, duration),
+      currentTutorialStepIs: (stepId) => this.currentTutorialStepIs(stepId),
+      completeTutorialStep: (stepId) => this.completeTutorialStep(stepId),
+      startTutorialBossPoseBreak: () => this.startTutorialBossPoseBreak()
+    });
+    if (progression && !progression.getSnapshot().tutorialCompleted) {
+      this.selectedMode = "tutorial";
+    }
     this.state = this.createInitialState();
     this.startMode();
   }
@@ -108,6 +135,8 @@ export class GameSimulation {
     this.updatePreparedSkillExpiry();
     this.updateBossChallengeExpiry();
     this.updatePlayer(step, input);
+    this.updateStageHazards(step);
+    this.updateSynergyEffects(step);
     this.updateSpawning(step);
     this.updateSurvivalFlow();
     this.updateEnemies(step);
@@ -115,6 +144,7 @@ export class GameSimulation {
     this.updateAllies(step);
     this.updateProjectiles(step);
     this.updateBasicAttack(step);
+    this.updateTutorial(step, input);
     this.checkWaveComplete();
   }
 
@@ -131,6 +161,15 @@ export class GameSimulation {
     if (state.bossChallenge) {
       return { ok: false, line: "보스 포즈 브레이크가 우선입니다." };
     }
+    if (state.mode === "tutorial") {
+      const stepId = this.getCurrentTutorialStep()?.id;
+      if (stepId !== "prepare-q" && stepId !== "cast-skill") {
+        return { ok: false, line: "튜토리얼 목표를 먼저 완료하세요." };
+      }
+      if (slot !== "Q") {
+        return { ok: false, line: "이번 단계에서는 Q 스킬만 사용합니다." };
+      }
+    }
     if (state.cooldowns[slot] > 0) {
       return { ok: false, line: `${skill.name} 쿨타임 ${state.cooldowns[slot].toFixed(1)}초` };
     }
@@ -144,7 +183,11 @@ export class GameSimulation {
       expiresAt: state.time + 1.55
     };
     state.message = skill.gestureLabel;
-    this.fxEvents.push({ kind: "sound", sound: "prepare" });
+    this.fxEvents.push({ kind: "sound", sound: "cast-start" });
+    if (slot === "Q") {
+      state.tutorial.skillPrepared = true;
+      this.completeTutorialStep("prepare-q");
+    }
     return { ok: true, line: skill.gestureLabel };
   }
 
@@ -173,7 +216,7 @@ export class GameSimulation {
       state.cooldowns[prepared.slot] = skill.cooldown * (state.activeCoreId === "stability-core" ? 0.16 : 0.3) * state.upgrades.missCooldownMultiplier;
       state.player.comboPerfect = 0;
       state.player.sameSkillChain = 0;
-      this.progression?.recordCast(state.characterId, skill.id, result.grade);
+      this.addUnlockedAchievements(this.progression?.recordCast(state.characterId, skill.id, result.grade) ?? []);
       state.message = getCharacter(state.characterId).failureLine;
       this.fxEvents.push({
         kind: "float-text",
@@ -186,7 +229,7 @@ export class GameSimulation {
       return { ok: true, line: state.message };
     }
 
-    state.cooldowns[prepared.slot] = skill.cooldown * (state.dailyChallengeId === "unstable-core" ? 1.15 : 1) * state.upgrades.cooldownMultiplier;
+    state.cooldowns[prepared.slot] = skill.cooldown * state.upgrades.cooldownMultiplier;
     state.player.gauge = clamp(state.player.gauge - skill.gaugeCost, 0, state.player.maxGauge);
     state.player.sameSkillChain = state.player.lastSkillId === skill.id ? Math.min(5, state.player.sameSkillChain + 1) : 1;
     state.player.lastSkillId = skill.id;
@@ -194,23 +237,41 @@ export class GameSimulation {
     if (result.grade === "Perfect") {
       state.player.comboPerfect += 1;
       state.runStats.maxPerfectCombo = Math.max(state.runStats.maxPerfectCombo, state.player.comboPerfect);
+      if (this.hasSynergy("perfect-caster")) {
+        state.player.score += Math.round((120 + state.player.comboPerfect * 24) * state.upgrades.scoreMultiplier);
+        this.fxEvents.push({
+          kind: "float-text",
+          x: state.player.x,
+          y: state.player.y - 124,
+          text: "BUILD SCORE",
+          color: 0xffd166
+        });
+      }
       state.cooldowns[prepared.slot] *= 1 - state.upgrades.perfectCooldownRefund;
       if (state.activeCoreId === "rhythm-core") {
         state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
         state.upgrades.basicAttackRateMultiplier = Math.max(state.upgrades.basicAttackRateMultiplier, 1.18);
       }
-      if (state.dailyChallengeId === "perfect-surge") {
-        state.player.gauge = clamp(state.player.gauge + 12, 0, state.player.maxGauge);
+      if (this.dailyModifiers.perfectGaugeGain > 0) {
+        state.player.gauge = clamp(state.player.gauge + this.dailyModifiers.perfectGaugeGain, 0, state.player.maxGauge);
       }
       if (state.upgrades.perfectGaugeBonus > 0) {
         state.player.gauge = clamp(state.player.gauge + state.upgrades.perfectGaugeBonus, 0, state.player.maxGauge);
       }
       this.applyPerfectComboBonus();
+      this.pushPerfectCastPresentation(skill.color);
     } else {
       state.player.comboPerfect = 0;
     }
 
+    const dailySkillDamageMultiplier = this.getDailySkillCastDamageMultiplier(skill.gestureId, result.grade);
+    const originalSkillDamageMultiplier = state.upgrades.skillDamageMultiplier;
+    state.upgrades.skillDamageMultiplier *= dailySkillDamageMultiplier;
     this.resolveSkillEffect(skill.id, result.grade);
+    state.upgrades.skillDamageMultiplier = originalSkillDamageMultiplier;
+    this.applyPostSkillSynergy(skill.color);
+    state.tutorial.skillCast = true;
+    this.completeTutorialStep("cast-skill");
     if (state.activeCoreId === "echo-core" && Math.random() < (result.grade === "Perfect" ? 0.22 : 0.14)) {
       this.resolveSkillEffect(skill.id, "Normal");
       this.fxEvents.push({
@@ -224,7 +285,7 @@ export class GameSimulation {
     if (state.activeCoreId === "guard-core" && isGuardSkill(skill.id)) {
       state.player.shield = Math.max(state.player.shield, result.grade === "Perfect" ? 30 : 18);
     }
-    this.progression?.recordCast(state.characterId, skill.id, result.grade);
+    this.addUnlockedAchievements(this.progression?.recordCast(state.characterId, skill.id, result.grade) ?? []);
 
     const line =
       skill.slot === "F"
@@ -235,6 +296,9 @@ export class GameSimulation {
           ? getCharacter(state.characterId).perfectLine
           : `${skill.name} ${result.grade}`;
     state.message = line;
+    if (skill.slot === "F" && (result.grade === "Great" || result.grade === "Perfect")) {
+      this.pushCutIn(skill.name.toUpperCase(), result.grade === "Perfect" ? getCharacter(state.characterId).ultimateLine : "궁극기 포즈 캐스팅", skill.color, 640);
+    }
     this.fxEvents.push({
       kind: "float-text",
       x: state.player.x,
@@ -242,11 +306,8 @@ export class GameSimulation {
       text: result.grade,
       color: skill.color
     });
-    this.fxEvents.push({
-      kind: "sound",
-      sound: result.grade === "Perfect" ? "perfect" : result.grade === "Great" ? "great" : "normal",
-      grade: result.grade
-    });
+    this.fxEvents.push({ kind: "sound", sound: characterSkillSound(state.characterId), grade: result.grade });
+    this.fxEvents.push({ kind: "sound", sound: castGradeSound(result.grade), grade: result.grade });
     return { ok: true, line };
   }
 
@@ -254,11 +315,12 @@ export class GameSimulation {
     if (this.state.bossChallenge) {
       const challenge = this.state.bossChallenge;
       return this.castBossChallenge({
-        gestureId: challenge.requiredGesture,
+        gestureId: getCurrentBossChallengeGesture(challenge),
         score: grade === "Perfect" ? 96 : grade === "Great" ? 82 : 58,
         grade,
         confidence: 1,
-        reason: "debug input"
+        reason: "debug input",
+        breakdown: debugBreakdown(grade, "디버그 입력으로 포즈 성공을 시뮬레이션했습니다.")
       });
     }
 
@@ -275,7 +337,8 @@ export class GameSimulation {
       score: grade === "Perfect" ? 96 : grade === "Great" ? 82 : 58,
       grade,
       confidence: 1,
-      reason: "debug input"
+      reason: "debug input",
+      breakdown: debugBreakdown(grade, "디버그 입력으로 포즈 성공을 시뮬레이션했습니다.")
     });
   }
 
@@ -285,89 +348,45 @@ export class GameSimulation {
       return { ok: false, line: "진행 중인 보스 포즈 브레이크가 없습니다." };
     }
 
-    this.state.bossChallenge = null;
-    const grade: CastGrade = result.gestureId === challenge.requiredGesture ? result.grade : "Miss";
+    const requiredGesture = getCurrentBossChallengeGesture(challenge);
+    const grade: CastGrade = result.gestureId === requiredGesture ? result.grade : "Miss";
     if (grade === "Miss") {
+      this.state.bossChallenge = null;
       return this.failBossChallenge(challenge);
     }
 
+    if (challenge.currentIndex < challenge.sequence.length - 1) {
+      challenge.currentIndex += 1;
+      challenge.requiredGesture = getCurrentBossChallengeGesture(challenge);
+      challenge.prompt = challenge.stepPrompts[challenge.currentIndex] ?? challenge.prompt;
+      challenge.expiresAt = this.state.time + challenge.stepDuration;
+      this.state.bossChallenge = challenge;
+      this.state.message = `다음 포즈: ${challenge.prompt}`;
+      this.fxEvents.push({
+        kind: "float-text",
+        x: this.state.player.x,
+        y: this.state.player.y - 100,
+        text: `NEXT ${challenge.currentIndex + 1}/${challenge.sequence.length}`,
+        color: grade === "Perfect" ? 0xffd166 : 0x48f7ff
+      });
+      this.fxEvents.push({ kind: "sound", sound: "boss-break-success", grade });
+      return { ok: true, line: this.state.message };
+    }
+
+    this.state.bossChallenge = null;
     return this.succeedBossChallenge(challenge, grade);
   }
 
   private castTrainingDebugGrade(grade: Exclude<CastGrade, "Miss">): CastResponse {
-    const gestureId = this.getNextTrainingGesture();
-    const result: GestureResult = {
-      gestureId,
-      score: grade === "Perfect" ? 96 : grade === "Great" ? 82 : 58,
-      grade,
-      confidence: 1,
-      reason: "debug input"
-    };
-    this.recordTrainingGestureResult(result);
-    this.state.runStats.skillsUsed += 1;
-    this.state.runStats[grade === "Perfect" ? "perfectCasts" : grade === "Great" ? "greatCasts" : "normalCasts"] += 1;
-    if (grade === "Perfect") {
-      this.state.player.comboPerfect += 1;
-      this.state.runStats.maxPerfectCombo = Math.max(this.state.runStats.maxPerfectCombo, this.state.player.comboPerfect);
-    } else {
-      this.state.player.comboPerfect = 0;
-    }
-    this.state.message = `훈련 ${gestureId} ${grade}`;
-    this.fxEvents.push({
-      kind: "float-text",
-      x: this.state.player.x,
-      y: this.state.player.y - 86,
-      text: grade,
-      color: grade === "Perfect" ? 0xffd166 : grade === "Great" ? 0xb8ff5c : 0x48f7ff
-    });
-    this.fxEvents.push({ kind: "sound", sound: grade === "Perfect" ? "perfect" : grade === "Great" ? "great" : "normal", grade });
-    return { ok: true, line: this.state.message };
+    return castTrainingDebugGrade(this.state, this.fxEvents, grade);
   }
 
   private getNextTrainingGesture(): GestureResult["gestureId"] {
-    return this.state.training.missions.find((mission) => !mission.completed)?.gestureId ?? this.state.training.missions[0]?.gestureId ?? "slash";
+    return getNextTrainingGesture(this.state);
   }
 
   private recordTrainingGestureResult(result: GestureResult): void {
-    const state = this.state;
-    if (state.mode !== "training") {
-      return;
-    }
-
-    state.training.lastResult = {
-      gestureId: result.gestureId,
-      score: result.score,
-      grade: result.grade,
-      reason: result.reason,
-      at: state.time
-    };
-
-    const mission = state.training.missions.find((item) => item.gestureId === result.gestureId);
-    if (!mission) {
-      return;
-    }
-
-    const wasCompleted = mission.completed;
-    mission.attempts += 1;
-    if (result.grade === "Perfect") {
-      mission.perfects += 1;
-    }
-    if (result.grade !== "Miss") {
-      mission.successes = Math.min(mission.targetSuccesses, mission.successes + 1);
-      mission.completed = mission.successes >= mission.targetSuccesses;
-    }
-
-    if (!wasCompleted && mission.completed) {
-      state.training.completedRewardKeys.push(mission.rewardKey);
-      this.fxEvents.push({
-        kind: "float-text",
-        x: state.player.x,
-        y: state.player.y - 126,
-        text: `${mission.title} COMPLETE`,
-        color: 0xffd166
-      });
-      this.fxEvents.push({ kind: "sound", sound: "reward" });
-    }
+    recordTrainingGestureResult(this.state, this.fxEvents, result);
   }
 
   chooseReward(rewardId: string): void {
@@ -376,21 +395,70 @@ export class GameSimulation {
       return;
     }
 
-    this.applyReward(rewardId);
+    const reward = this.applyReward(rewardId);
     state.runStats.rewardsChosen.push(rewardId);
+    this.updateSynergies();
+    this.fxEvents.push({ kind: "sound", sound: rewardSoundForRarity(reward?.rarity ?? "common") });
+    if (state.mode === "tutorial") {
+      state.tutorial.rewardChosen = true;
+    }
     state.pendingRewardIds = [];
+    state.rewardOfferHistoryIds = [];
     this.continueAfterReward();
+  }
+
+  rerollRewards(): CastResponse {
+    const state = this.state;
+    if (state.pendingRewardIds.length === 0) {
+      return { ok: false, line: "리롤할 보상 카드가 없습니다." };
+    }
+    if (state.rewardRerollsRemaining <= 0) {
+      return { ok: false, line: "이번 런의 리롤 횟수를 모두 사용했습니다." };
+    }
+
+    const isFree = state.rewardRerollsRemaining >= 2;
+    const nextRewards = this.rollRewards(state.pendingRewardIds.length, state.rewardOfferHistoryIds);
+    if (nextRewards.length === 0) {
+      return { ok: false, line: "새로 제안할 카드가 없습니다." };
+    }
+
+    if (!isFree) {
+      if (state.player.score >= 500) {
+        state.player.score -= 500;
+      } else if (state.player.gauge >= 20) {
+        state.player.gauge = clamp(state.player.gauge - 20, 0, state.player.maxGauge);
+      } else {
+        return { ok: false, line: "리롤 비용이 부족합니다. 점수 500 또는 게이지 20이 필요합니다." };
+      }
+    }
+
+    state.pendingRewardIds = nextRewards;
+    state.rewardOfferHistoryIds = Array.from(new Set([...state.rewardOfferHistoryIds, ...nextRewards]));
+    state.rewardRerollsRemaining -= 1;
+    state.message = isFree ? "무료 리롤" : "유료 리롤";
+    this.fxEvents.push({
+      kind: "float-text",
+      x: state.player.x,
+      y: state.player.y - 116,
+      text: "REROLL",
+      color: 0xffd166
+    });
+    this.fxEvents.push({ kind: "sound", sound: "reward-common" });
+    return { ok: true, line: isFree ? "무료 리롤 사용" : "리롤 비용 지불" };
   }
 
   private createInitialState(): GameState {
     const character = getCharacter(this.selectedCharacterId);
     const progress = this.progression?.getSnapshot();
     const daily = this.progression?.getDailyChallenge();
-    const activeCoreId = progress?.equippedCoreId ?? "stability-core";
+    this.dailyModifiers = { ...DEFAULT_DAILY_MODIFIERS, ...(daily?.modifiers ?? {}) };
+    const activeCoreId = this.dailyModifiers.randomCore
+      ? CORES[Math.floor(Math.random() * CORES.length)]?.id ?? "stability-core"
+      : progress?.equippedCoreId ?? "stability-core";
     const equippedSkinId = progress?.equippedSkins[this.selectedCharacterId] ?? getDefaultSkinId(this.selectedCharacterId);
     const effectPaletteId = progress?.equippedEffectPaletteId ?? "classic";
     const characterLevel = progress?.characters[this.selectedCharacterId]?.level ?? 1;
-    const maxHp = Math.round(character.hp * (daily?.id === "close-call" ? 0.78 : 1));
+    const maxHp = Math.round(character.hp * this.dailyModifiers.playerHpMultiplier);
     const state: GameState = {
       time: 0,
       mode: this.selectedMode,
@@ -399,6 +467,7 @@ export class GameSimulation {
       gameOver: false,
       victory: false,
       stageName: "루프시티 거리",
+      stageRegion: "루프시티",
       adventureStageIndex: 0,
       adventureStageTotal: ADVENTURE_STAGES.length,
       adventureStageCode: "",
@@ -406,10 +475,13 @@ export class GameSimulation {
       adventureStageEnemyTotal: 0,
       adventureStageStartTime: 0,
       adventureStageStartScore: 0,
+      adventureStageStartMisses: 0,
       activeCoreId,
       equippedSkinId,
       effectPaletteId,
       dailyChallengeId: daily?.id ?? "none",
+      dailyChallengeTitle: daily?.title ?? "데일리 없음",
+      dailyChallengeDescription: daily?.description ?? "",
       modeTime: 0,
       survivalNextRewardAt: 60,
       survivalFinalBossSpawned: false,
@@ -419,6 +491,8 @@ export class GameSimulation {
       spawnQueue: [],
       spawnTimer: 0,
       pendingRewardIds: [],
+      rewardOfferHistoryIds: [],
+      rewardRerollsRemaining: 2,
       rewardStacks: {},
       preparedSkill: null,
       bossChallenge: null,
@@ -431,7 +505,7 @@ export class GameSimulation {
         maxHp,
         shield: 0,
         level: characterLevel,
-        gauge: 82,
+        gauge: this.dailyModifiers.startingGauge,
         maxGauge: 100,
         facing: { x: 1, y: 0 },
         dashCooldown: 0,
@@ -463,11 +537,22 @@ export class GameSimulation {
         skillsUsed: 0,
         rewardsChosen: [],
         unlockedItems: [],
+        unlockedAchievements: [],
         xpGained: 0,
         levelBefore: characterLevel,
-        levelAfter: characterLevel
+        levelAfter: characterLevel,
+        dailyChallengeTitle: daily?.title ?? "데일리 없음",
+        dailyChallengeCleared: false,
+        bossPosePerfectCounters: 0,
+        shieldDamageAbsorbed: 0,
+        markedEnemyKills: 0,
+        slimesSummoned: 0,
+        bossesDefeated: []
       },
       training: createTrainingState(),
+      tutorial: createTutorialState(),
+      activeSynergies: [],
+      stageHazards: [],
       enemies: [],
       projectiles: [],
       traps: [],
@@ -553,14 +638,19 @@ export class GameSimulation {
     if (state.activeCoreId === "rhythm-core") {
       state.upgrades.basicAttackRateMultiplier += 0.08;
     }
-    if (state.dailyChallengeId === "unstable-core") {
-      state.upgrades.gaugeGainMultiplier += 0.35;
-    }
-    if (state.dailyChallengeId === "close-call") {
-      state.upgrades.dashSkillDamageMultiplier += 0.35;
-    }
+    this.applyDailyInitialModifiers(state);
 
     return state;
+  }
+
+  private applyDailyInitialModifiers(state: GameState): void {
+    const modifiers = this.dailyModifiers;
+    state.upgrades.cooldownMultiplier *= modifiers.skillCooldownMultiplier;
+    state.upgrades.missCooldownMultiplier *= modifiers.missCooldownMultiplier;
+    state.upgrades.gaugeGainMultiplier *= modifiers.killGaugeMultiplier;
+    state.upgrades.scoreMultiplier *= modifiers.enemyScoreMultiplier;
+    state.upgrades.dashSkillDamageMultiplier += modifiers.dashSkillDamageBonus;
+    state.upgrades.areaMultiplier *= modifiers.areaDamageMultiplier;
   }
 
   private updateTimers(dt: number): void {
@@ -583,9 +673,9 @@ export class GameSimulation {
     if (state.player.infiniteGaugeTime > 0) {
       state.player.gauge = state.player.maxGauge;
     }
-    if (state.mode === "training") {
+    if (state.mode === "tutorial" || state.mode === "training") {
       state.player.gauge = state.player.maxGauge;
-      state.player.hp = Math.max(state.player.hp, state.player.maxHp);
+      state.player.hp = state.mode === "training" ? Math.max(state.player.hp, state.player.maxHp) : Math.max(state.player.hp, 35);
     }
 
     for (const enemy of state.enemies) {
@@ -605,7 +695,8 @@ export class GameSimulation {
         score: 0,
         grade: "Miss",
         confidence: 0,
-        reason: "포즈 시간이 지났습니다."
+        reason: "포즈 시간이 지났습니다.",
+        breakdown: debugBreakdown("Miss", "제한 시간 안에 동작을 끝내보세요.")
       });
     }
   }
@@ -633,7 +724,7 @@ export class GameSimulation {
       const dashDirection = Math.abs(move.x) + Math.abs(move.y) > 0 ? move : player.facing;
       player.facing = dashDirection;
       player.dashTime = 0.16;
-      player.dashCooldown = 1.05;
+      player.dashCooldown = 1.05 * this.dailyModifiers.dashCooldownMultiplier;
       player.invulnerableTime = 0.24;
       player.dashBuffTime = 2;
       if (this.state.upgrades.dashShield > 0) {
@@ -653,6 +744,7 @@ export class GameSimulation {
         color: 0xffd166
       });
       this.fxEvents.push({ kind: "sound", sound: "dash" });
+      this.completeTutorialStep("dash");
     }
 
     const baseSpeed = getCharacter(this.state.characterId).speed;
@@ -661,6 +753,114 @@ export class GameSimulation {
     const direction = player.dashTime > 0 ? player.facing : move;
     player.x = clamp(player.x + direction.x * speed * dt, 48, WORLD_WIDTH - 48);
     player.y = clamp(player.y + direction.y * speed * dt, 48, WORLD_HEIGHT - 48);
+  }
+
+  private updateStageHazards(dt: number): void {
+    const state = this.state;
+    if (state.stageHazards.length === 0 || state.mode === "training") {
+      return;
+    }
+
+    const player = state.player;
+    for (const hazard of state.stageHazards) {
+      hazard.cooldown = Math.max(0, hazard.cooldown - dt);
+      hazard.pulseTimer += dt;
+
+      if (hazard.kind === "rotator") {
+        hazard.angle += dt * (0.95 + hazard.strength * 0.015);
+      } else if (hazard.kind === "mirror-reversal") {
+        hazard.angle -= dt * 0.72;
+      } else {
+        hazard.angle += dt * 0.42;
+      }
+      const active = isStageHazardActive(hazard, state.time);
+      hazard.activeTime = active ? hazard.activeTime + dt : 0;
+
+      const touching = distance(player, hazard) <= player.radius + hazard.radius;
+      if (!touching) {
+        continue;
+      }
+
+      if (hazard.kind === "rotator") {
+        if (!active) {
+          continue;
+        }
+        const radial = normalize({ x: player.x - hazard.x, y: player.y - hazard.y });
+        const tangent = { x: -radial.y, y: radial.x };
+        player.x = clamp(player.x + (tangent.x * 155 + radial.x * 34) * dt, 48, WORLD_WIDTH - 48);
+        player.y = clamp(player.y + (tangent.y * 155 + radial.y * 34) * dt, 48, WORLD_HEIGHT - 48);
+        if (hazard.cooldown <= 0) {
+          hazard.cooldown = 0.9;
+          this.damagePlayer(7);
+          this.fxEvents.push({
+            kind: "float-text",
+            x: player.x,
+            y: player.y - 72,
+            text: "SPIN ZONE",
+            color: 0xff5ea8
+          });
+        }
+        continue;
+      }
+
+      if (hazard.kind === "mirror-reversal") {
+        if (!active || hazard.cooldown > 0) {
+          continue;
+        }
+        hazard.cooldown = 3.2;
+        player.controlReverseTime = Math.max(player.controlReverseTime, 1.75);
+        this.fxEvents.push({
+          kind: "burst",
+          x: player.x,
+          y: player.y,
+          radius: hazard.radius * 0.45,
+          color: 0xc7b8ff
+        });
+        this.fxEvents.push({
+          kind: "float-text",
+          x: player.x,
+          y: player.y - 76,
+          text: "MIRROR FLIP",
+          color: 0xc7b8ff
+        });
+        continue;
+      }
+
+      if (hazard.kind === "stasis-drain") {
+        if (player.infiniteGaugeTime <= 0) {
+          player.gauge = clamp(player.gauge - hazard.strength * dt, 0, player.maxGauge);
+        }
+        player.movementSlowTime = Math.max(player.movementSlowTime, 0.14);
+        if (hazard.cooldown <= 0) {
+          hazard.cooldown = 1.05;
+          this.fxEvents.push({
+            kind: "float-text",
+            x: player.x,
+            y: player.y - 80,
+            text: "CORE DRAIN",
+            color: 0x8c7aff
+          });
+        }
+      }
+    }
+  }
+
+  private updateSynergyEffects(dt: number): void {
+    const state = this.state;
+    if (this.hasSynergy("maru-oni-wall") && state.player.shield >= 50) {
+      for (const enemy of state.enemies) {
+        if (enemy.type === "dummy") {
+          continue;
+        }
+        const dist = distance(state.player, enemy);
+        if (dist > 0 && dist < state.player.radius + enemy.radius + 210) {
+          const away = normalize({ x: enemy.x - state.player.x, y: enemy.y - state.player.y });
+          enemy.x = clamp(enemy.x + away.x * 62 * dt, 28, WORLD_WIDTH - 28);
+          enemy.y = clamp(enemy.y + away.y * 62 * dt, 28, WORLD_HEIGHT - 28);
+          enemy.slowTime = Math.max(enemy.slowTime, 0.12);
+        }
+      }
+    }
   }
 
   private updateSpawning(dt: number): void {
@@ -688,6 +888,7 @@ export class GameSimulation {
     if (!state.survivalFinalBossSpawned && state.modeTime >= 540) {
       state.survivalFinalBossSpawned = true;
       state.stageName = "제로 존";
+      this.setStageRegion("제로 존");
       state.spawnQueue.push("zero");
       state.waveActive = true;
       state.message = "제로 모션 난입";
@@ -697,7 +898,7 @@ export class GameSimulation {
 
     if (state.modeTime >= state.survivalNextRewardAt && state.modeTime < 540) {
       state.survivalNextRewardAt += 60;
-      state.pendingRewardIds = this.rollRewards(3);
+      this.openRewardChoice(3);
       state.message = "생존 보상";
       return;
     }
@@ -724,12 +925,74 @@ export class GameSimulation {
       const dir = normalize(toPlayer);
       const dist = distance(enemy, player);
       const speedScale = enemy.slowTime > 0 ? 0.46 : 1;
+      if (Math.abs(dir.x) + Math.abs(dir.y) > 0) {
+        enemy.facing = dir;
+      }
+      if (isBossEnemy(enemy.type)) {
+        this.updateBossPhase(enemy);
+      }
 
       if (enemy.type === "dummy") {
         continue;
       } else if (enemy.type === "runner" || enemy.type === "swarm") {
         enemy.x += dir.x * enemy.speed * speedScale * dt;
         enemy.y += dir.y * enemy.speed * speedScale * dt;
+      } else if (enemy.type === "castBreaker") {
+        const desired = state.preparedSkill ? 2.45 : dist < 280 ? -0.25 : 0.7;
+        enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
+        enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
+        if (state.preparedSkill && dist < enemy.radius + player.radius + 14) {
+          state.preparedSkill = null;
+          state.message = "캐스트 브레이커가 포즈를 끊었습니다.";
+          this.damagePlayer(5);
+          enemy.slowTime = Math.max(enemy.slowTime, 0.7);
+          enemy.pulseCooldown = 1.5;
+          this.fxEvents.push({
+            kind: "float-text",
+            x: player.x,
+            y: player.y - 86,
+            text: "CAST BREAK",
+            color: 0xff5ea8
+          });
+          this.fxEvents.push({ kind: "shake", intensity: 0.01, duration: 110 });
+        }
+      } else if (enemy.type === "shieldNoise") {
+        const desired = dist < 210 ? -0.15 : dist > 360 ? 0.68 : 0.18;
+        enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
+        enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
+      } else if (enemy.type === "anchorNoise") {
+        const desired = dist < 360 ? -0.12 : dist > 520 ? 0.34 : 0;
+        enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
+        enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
+        if (enemy.pulseCooldown <= 0) {
+          this.spawnTrap({
+            kind: "noise-trap",
+            x: player.x + randomRange(-90, 90),
+            y: player.y + randomRange(-90, 90),
+            radius: 118,
+            damage: 2.5,
+            ttl: 4.8,
+            color: 0x8c7aff
+          });
+          enemy.pulseCooldown = randomRange(4.2, 5.3);
+          this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 58, text: "ANCHOR", color: 0x8c7aff });
+        }
+      } else if (enemy.type === "medicNoise") {
+        const desired = dist < 420 ? -0.5 : dist > 680 ? 0.4 : 0;
+        const side = { x: -dir.y, y: dir.x };
+        enemy.x += (dir.x * desired + side.x * 0.22) * enemy.speed * speedScale * dt;
+        enemy.y += (dir.y * desired + side.y * 0.22) * enemy.speed * speedScale * dt;
+        if (enemy.pulseCooldown <= 0) {
+          const healed = this.healNearbyEnemies(enemy, 9, 300);
+          enemy.pulseCooldown = healed > 0 ? 1.2 : 1.9;
+        }
+      } else if (enemy.type === "bombNoise") {
+        enemy.x += dir.x * enemy.speed * speedScale * dt;
+        enemy.y += dir.y * enemy.speed * speedScale * dt;
+        if (dist < 86) {
+          this.explodeBombNoise(enemy);
+          continue;
+        }
       } else if (enemy.type === "shooter") {
         const desired = dist < 360 ? -1 : dist > 560 ? 1 : 0.2;
         enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
@@ -755,16 +1018,24 @@ export class GameSimulation {
         const desired = dist < 520 ? -0.28 : dist > 720 ? 0.42 : 0;
         enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
         enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
+        if (enemy.phase >= 2 && enemy.shootCooldown <= 0) {
+          this.spawnDrumWarningCircles(enemy, enemy.phase >= 3 ? 5 : 3);
+          enemy.shootCooldown = randomRange(enemy.phase >= 3 ? 2.4 : 3.4, enemy.phase >= 3 ? 3.2 : 4.3);
+        }
         if (enemy.pulseCooldown <= 0) {
           this.fireDrumPulse(enemy);
-          this.startBossChallenge(enemy, {
-            bossType: "drum",
-            requiredGesture: "cross-guard",
-            prompt: "팔을 X자로 교차해 리듬 반사를 카운터하세요",
-            successEffect: "drum-counter",
-            failDamage: 18,
-            duration: 2.25
-          });
+          if (enemy.phase >= 3) {
+            this.startDrumComboChallenge(enemy);
+          } else {
+            this.startBossChallenge(enemy, {
+              bossType: "drum",
+              requiredGesture: "cross-guard",
+              prompt: "팔을 X자로 교차해 리듬 반사를 카운터하세요",
+              successEffect: "drum-counter",
+              failDamage: 18,
+              duration: 2.25
+            });
+          }
           enemy.pulseCooldown = randomRange(6.4, 7.6);
         }
       } else if (enemy.type === "mirror") {
@@ -773,38 +1044,54 @@ export class GameSimulation {
         enemy.x += dir.x * enemy.speed * speedScale * desired * castingPressure * dt;
         enemy.y += dir.y * enemy.speed * speedScale * desired * castingPressure * dt;
         if (enemy.shootCooldown <= 0 && dist < 820) {
-          this.fireMirrorFan(enemy, dir);
-          enemy.shootCooldown = randomRange(1.25, 1.8);
+          if (enemy.phase >= 2) {
+            this.fireMirrorCopiedSkill(enemy);
+            enemy.shootCooldown = randomRange(enemy.phase >= 3 ? 1.05 : 1.25, enemy.phase >= 3 ? 1.55 : 1.9);
+          } else {
+            this.fireMirrorFan(enemy, dir);
+            enemy.shootCooldown = randomRange(1.25, 1.8);
+          }
         }
         if (enemy.pulseCooldown <= 0) {
           this.spawnMirrorClone(enemy);
-          this.startBossChallenge(enemy, {
-            bossType: "mirror",
-            requiredGesture: "slash",
-            prompt: "손을 날카롭게 휘둘러 거울 분신을 깨세요",
-            successEffect: "mirror-shatter",
-            failDamage: 4,
-            duration: 2.05
-          });
+          if (enemy.phase >= 3) {
+            this.startMirrorPrisonChallenge(enemy);
+          } else {
+            this.startBossChallenge(enemy, {
+              bossType: "mirror",
+              requiredGesture: "slash",
+              prompt: "손을 날카롭게 휘둘러 거울 분신을 깨세요",
+              successEffect: "mirror-shatter",
+              failDamage: 4,
+              duration: 2.05
+            });
+          }
           enemy.pulseCooldown = randomRange(7.2, 8.6);
         }
       } else {
         const desired = dist < 470 ? -0.22 : dist > 660 ? 0.28 : 0;
         enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
         enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
+        if (enemy.phase >= 2 && enemy.shootCooldown <= 0) {
+          this.spawnZeroStasisHazards(enemy, enemy.phase >= 3 ? 2 : 1);
+          enemy.shootCooldown = randomRange(enemy.phase >= 3 ? 4.2 : 5.2, enemy.phase >= 3 ? 5.2 : 6.4);
+        }
         if (dist < 520) {
           player.gauge = clamp(player.gauge - 6 * dt, 0, player.maxGauge);
           player.dashCooldown = Math.max(player.dashCooldown, 0.15);
         }
         if (enemy.pulseCooldown <= 0) {
-          const challenged = this.startBossChallenge(enemy, {
-            bossType: "zero",
-            requiredGesture: "open-arms",
-            prompt: "양팔을 크게 벌려 제로 모션의 정지장을 깨세요",
-            successEffect: "zero-release",
-            failDamage: 22,
-            duration: 2.45
-          });
+          const challenged =
+            enemy.phase >= 3
+              ? this.startZeroFinalChallenge(enemy)
+              : this.startBossChallenge(enemy, {
+                  bossType: "zero",
+                  requiredGesture: "open-arms",
+                  prompt: "양팔을 크게 벌려 제로 모션의 정지장을 깨세요",
+                  successEffect: "zero-release",
+                  failDamage: 22,
+                  duration: 2.45
+                });
           if (!challenged) {
             this.fireZeroMotionPulse(enemy);
           }
@@ -816,7 +1103,7 @@ export class GameSimulation {
       enemy.y = clamp(enemy.y, 28, WORLD_HEIGHT - 28);
 
       if (enemy.type !== "drum" && dist < enemy.radius + player.radius && player.hurtCooldown <= 0) {
-        this.damagePlayer(enemy.type === "zero" ? 13 : enemy.type === "mirror" ? 9 : enemy.type === "tank" ? 10 : enemy.type === "runner" ? 6 : 4);
+        this.damagePlayer(contactDamageForEnemy(enemy.type));
         player.x = clamp(player.x + dir.x * -38, 48, WORLD_WIDTH - 48);
         player.y = clamp(player.y + dir.y * -38, 48, WORLD_HEIGHT - 48);
       }
@@ -830,6 +1117,27 @@ export class GameSimulation {
     for (const trap of state.traps) {
       trap.ttl -= dt;
       trap.pulseTimer -= dt;
+      if (trap.kind === "drum-warning") {
+        if (trap.ttl <= 0) {
+          if (distance(trap, state.player) < trap.radius + state.player.radius) {
+            state.player.invulnerableTime = 0;
+            state.player.hurtCooldown = 0;
+            this.damagePlayer(trap.damage);
+          }
+          this.fxEvents.push({
+            kind: "burst",
+            x: trap.x,
+            y: trap.y,
+            radius: trap.radius * 1.2,
+            color: trap.color,
+            grade: "Great"
+          });
+          this.fxEvents.push({ kind: "shake", intensity: 0.009, duration: 100 });
+          continue;
+        }
+        remaining.push(trap);
+        continue;
+      }
       if (trap.ttl <= 0) {
         continue;
       }
@@ -840,7 +1148,7 @@ export class GameSimulation {
           if (distance(trap, enemy) < trap.radius + enemy.radius) {
             enemy.slowTime = Math.max(enemy.slowTime, trap.kind === "sweet-field" ? 1.25 : 0.7);
             const markBonus = enemy.markedTime > 0 ? 1.45 : 1;
-            this.damageEnemy(enemy, trap.damage * markBonus, trap.color);
+            this.damageEnemy(enemy, trap.damage * markBonus, trap.color, { source: trap, bypassFrontGuard: true });
           }
         }
 
@@ -867,10 +1175,11 @@ export class GameSimulation {
   private updateAllies(dt: number): void {
     const state = this.state;
     const remaining: AllyState[] = [];
+    const allyTempo = this.hasSynergy("cookie-slime-party-chef") && state.allies.length >= 5 ? 1.35 : 1;
 
     for (const ally of state.allies) {
       ally.ttl -= dt;
-      ally.attackCooldown = Math.max(0, ally.attackCooldown - dt);
+      ally.attackCooldown = Math.max(0, ally.attackCooldown - dt * allyTempo);
       if (ally.ttl <= 0) {
         continue;
       }
@@ -883,7 +1192,7 @@ export class GameSimulation {
 
         if (distance(ally, target) < ally.radius + target.radius + 12 && ally.attackCooldown <= 0) {
           target.slowTime = Math.max(target.slowTime, ally.kind === "big-slime" ? 1.1 : 0.55);
-          this.damageEnemy(target, ally.damage, ally.color);
+          this.damageEnemy(target, ally.damage, ally.color, { source: ally });
           ally.attackCooldown = ally.kind === "big-slime" ? 0.42 : 0.62;
           this.fxEvents.push({
             kind: "burst",
@@ -924,7 +1233,8 @@ export class GameSimulation {
       if (projectile.owner === "player") {
         const hit = state.enemies.find((enemy) => distance(projectile, enemy) < projectile.radius + enemy.radius);
         if (hit) {
-          this.damageEnemy(hit, projectile.damage, projectile.color);
+          this.registerTutorialBasicAttackHit();
+          this.damageEnemy(hit, projectile.damage, projectile.color, { source: projectile });
           continue;
         }
       } else if (state.player.shieldWallTime > 0 && distance(projectile, state.player) < state.player.radius + 165) {
@@ -993,7 +1303,7 @@ export class GameSimulation {
 
   private checkWaveComplete(): void {
     const state = this.state;
-    if (state.mode === "training" || state.mode === "survival") {
+    if (state.mode === "tutorial" || state.mode === "training" || state.mode === "survival") {
       return;
     }
     if (!state.waveActive || state.spawnQueue.length > 0 || state.enemies.length > 0) {
@@ -1006,6 +1316,7 @@ export class GameSimulation {
 
     if (state.mode === "adventure") {
       const clearResult = this.recordAdventureStageClear();
+      this.addUnlockedAchievements(clearResult?.unlockedAchievements ?? []);
       const finalStageCleared = state.adventureStageIndex >= ADVENTURE_STAGES.length - 1;
       if (finalStageCleared) {
         state.victory = true;
@@ -1022,7 +1333,7 @@ export class GameSimulation {
         return;
       }
 
-      state.pendingRewardIds = this.rollRewards(3);
+      this.openRewardChoice(3);
       state.message = clearResult ? `${state.adventureStageCode} ${clearResult.grade} CLEAR` : `${state.adventureStageCode} CLEAR`;
       this.fxEvents.push({
         kind: "float-text",
@@ -1031,7 +1342,7 @@ export class GameSimulation {
         text: "STAGE CLEAR",
         color: 0xffd166
       });
-      this.fxEvents.push({ kind: "sound", sound: "reward" });
+      this.fxEvents.push({ kind: "sound", sound: "reward-rare" });
       return;
     }
 
@@ -1051,7 +1362,7 @@ export class GameSimulation {
         return;
       }
 
-      state.pendingRewardIds = this.rollRewards(3);
+      this.openRewardChoice(3);
       state.message = "다음 보스 준비";
       return;
     }
@@ -1071,7 +1382,7 @@ export class GameSimulation {
       return;
     }
 
-    state.pendingRewardIds = this.rollRewards(3);
+    this.openRewardChoice(3);
     state.message = "보상 선택";
   }
 
@@ -1085,11 +1396,71 @@ export class GameSimulation {
       stageId: stage.id,
       score: Math.max(0, state.player.score - state.adventureStageStartScore),
       seconds: Math.max(1, state.modeTime - state.adventureStageStartTime),
-      hpRatio: state.player.hp / state.player.maxHp
+      hpRatio: state.player.hp / state.player.maxHp,
+      misses: Math.max(0, state.runStats.misses - state.adventureStageStartMisses)
     }) ?? null;
   }
 
+  private setStageRegion(region: StageRegion): void {
+    this.state.stageRegion = region;
+    this.state.stageHazards = this.createStageHazards(region);
+  }
+
+  private createStageHazards(region: StageRegion): StageHazardState[] {
+    if (region === "놀이공원") {
+      return [
+        this.createStageHazard("rotator", WORLD_WIDTH / 2, WORLD_HEIGHT / 2, 178, 12, 0),
+        this.createStageHazard("rotator", WORLD_WIDTH / 2 - 440, WORLD_HEIGHT / 2 + 210, 126, 9, 1.7),
+        this.createStageHazard("rotator", WORLD_WIDTH / 2 + 470, WORLD_HEIGHT / 2 - 210, 118, 8, 3.1)
+      ];
+    }
+
+    if (region === "미러 타워") {
+      return [
+        this.createStageHazard("mirror-reversal", WORLD_WIDTH / 2 - 310, WORLD_HEIGHT / 2 - 130, 150, 1, 0.3),
+        this.createStageHazard("mirror-reversal", WORLD_WIDTH / 2 + 330, WORLD_HEIGHT / 2 + 150, 146, 1, 2.1)
+      ];
+    }
+
+    if (region === "제로 존") {
+      return [
+        this.createStageHazard("stasis-drain", WORLD_WIDTH / 2, WORLD_HEIGHT / 2, 196, 11, 0),
+        this.createStageHazard("stasis-drain", WORLD_WIDTH / 2 - 500, WORLD_HEIGHT / 2 - 250, 138, 7, 1.4),
+        this.createStageHazard("stasis-drain", WORLD_WIDTH / 2 + 500, WORLD_HEIGHT / 2 + 248, 138, 7, 2.8)
+      ];
+    }
+
+    return [];
+  }
+
+  private createStageHazard(
+    kind: StageHazardState["kind"],
+    x: number,
+    y: number,
+    radius: number,
+    strength: number,
+    phase: number
+  ): StageHazardState {
+    return {
+      id: this.nextEntityId++,
+      kind,
+      x,
+      y,
+      radius,
+      strength,
+      phase,
+      angle: phase,
+      cooldown: 0,
+      pulseTimer: 0,
+      activeTime: 0
+    };
+  }
+
   private startMode(): void {
+    if (this.state.mode === "tutorial") {
+      this.startTutorial();
+      return;
+    }
     if (this.state.mode === "training") {
       this.startTraining();
       return;
@@ -1107,6 +1478,33 @@ export class GameSimulation {
       return;
     }
     this.startNextWave();
+  }
+
+  private startTutorial(): void {
+    const state = this.state;
+    state.waveActive = false;
+    state.spawnQueue = [];
+    state.spawnTimer = 0;
+    state.stageName = "포즈 브레이크 튜토리얼";
+    this.setStageRegion("루프시티");
+    state.player.x = WORLD_WIDTH / 2;
+    state.player.y = WORLD_HEIGHT / 2;
+    state.player.gauge = state.player.maxGauge;
+    state.player.hp = state.player.maxHp;
+    state.message = "튜토리얼 시작";
+    state.tutorial = createTutorialState();
+    state.enemies = [];
+    state.projectiles = [];
+    state.traps = [];
+    state.allies = [];
+    this.setupTutorialStep();
+    this.fxEvents.push({
+      kind: "float-text",
+      x: state.player.x,
+      y: state.player.y - 112,
+      text: "TUTORIAL",
+      color: 0x48f7ff
+    });
   }
 
   private startAdventure(): void {
@@ -1128,13 +1526,15 @@ export class GameSimulation {
     }
 
     state.stageName = stage.title;
+    this.setStageRegion(stage.region);
     state.adventureStageCode = stage.code;
     state.adventureStageGoal = stage.goal;
     state.adventureStageEnemyTotal = stage.enemies.length;
     state.adventureStageStartTime = state.modeTime;
     state.adventureStageStartScore = state.player.score;
+    state.adventureStageStartMisses = state.runStats.misses;
     state.waveIndex = state.adventureStageIndex + 1;
-    state.spawnQueue = [...stage.enemies];
+    state.spawnQueue = this.applyDailySpawnModifiers([...stage.enemies]);
     state.waveActive = true;
     state.spawnTimer = 0.2;
     state.projectiles = state.projectiles.filter((projectile) => projectile.owner === "player");
@@ -1148,7 +1548,7 @@ export class GameSimulation {
       text: `AREA ${stage.code}`,
       color: 0xffd166
     });
-    this.fxEvents.push({ kind: "sound", sound: stage.enemies.some((enemy) => enemy === "drum" || enemy === "mirror" || enemy === "zero") ? "boss" : "reward" });
+    this.fxEvents.push({ kind: "sound", sound: stage.enemies.some((enemy) => enemy === "drum" || enemy === "mirror" || enemy === "zero") ? "boss" : "reward-common" });
   }
 
   private startTraining(): void {
@@ -1157,6 +1557,7 @@ export class GameSimulation {
     state.spawnQueue = [];
     state.spawnTimer = 0;
     state.stageName = "훈련장";
+    this.setStageRegion("훈련장");
     state.player.gauge = state.player.maxGauge;
     state.player.hp = state.player.maxHp;
     state.message = "훈련장";
@@ -1175,12 +1576,265 @@ export class GameSimulation {
       hp: 500,
       maxHp: 500,
       speed: 0,
+      facing: { x: 1, y: 0 },
+      phase: 1,
+      phaseTriggered: { phase2: false, phase3: false },
       shootCooldown: 0,
       pulseCooldown: 0,
       markedTime: 0,
       slowTime: 0,
       hitFlash: 0
     }));
+  }
+
+  private updateTutorial(dt: number, input: SimulationInput): void {
+    const state = this.state;
+    if (state.mode !== "tutorial" || state.tutorial.completed) {
+      return;
+    }
+
+    const step = this.getCurrentTutorialStep();
+    if (!step) {
+      this.completeTutorial();
+      return;
+    }
+
+    if (step.id === "move") {
+      const moving = Math.abs(input.move.x) + Math.abs(input.move.y) > 0.2;
+      state.tutorial.moveSeconds = moving ? state.tutorial.moveSeconds + dt : Math.max(0, state.tutorial.moveSeconds - dt * 0.35);
+      if (state.tutorial.moveSeconds >= 0.8) {
+        this.completeTutorialStep("move");
+      }
+      return;
+    }
+
+    if (step.id === "basic-attack" && state.enemies.length === 0) {
+      this.spawnTutorialBasicTarget();
+      return;
+    }
+
+    if (step.id === "cast-skill" && state.enemies.length < 2) {
+      this.spawnTutorialSkillTargets();
+      return;
+    }
+
+    if (step.id === "boss-pose-break" && !state.bossChallenge && !state.tutorial.bossChallengeCleared) {
+      this.startTutorialBossPoseBreak();
+    }
+  }
+
+  private completeTutorialStep(stepId: TutorialStepId): boolean {
+    const state = this.state;
+    if (state.mode !== "tutorial" || state.tutorial.completed) {
+      return false;
+    }
+
+    const step = this.getCurrentTutorialStep();
+    if (!step || step.id !== stepId || step.completed) {
+      return false;
+    }
+
+    step.completed = true;
+    state.tutorial.currentStepIndex += 1;
+    state.message = `${step.title} 완료`;
+    this.fxEvents.push({
+      kind: "float-text",
+      x: state.player.x,
+      y: state.player.y - 116,
+      text: "STEP CLEAR",
+      color: 0xb8ff5c
+    });
+    this.fxEvents.push({ kind: "sound", sound: "reward-common" });
+
+    if (state.tutorial.currentStepIndex >= state.tutorial.steps.length) {
+      this.completeTutorial();
+      return true;
+    }
+
+    this.setupTutorialStep();
+    return true;
+  }
+
+  private setupTutorialStep(): void {
+    const state = this.state;
+    const step = this.getCurrentTutorialStep();
+    if (!step) {
+      return;
+    }
+
+    state.message = step.prompt;
+    if (step.id === "basic-attack") {
+      state.enemies = [];
+      state.projectiles = [];
+      state.player.attackTimer = 0.08;
+      this.spawnTutorialBasicTarget();
+      return;
+    }
+
+    if (step.id === "prepare-q") {
+      state.player.gauge = state.player.maxGauge;
+      state.cooldowns.Q = 0;
+      state.message = "Q를 눌러 스파크 슬래시 준비";
+      return;
+    }
+
+    if (step.id === "cast-skill") {
+      state.player.gauge = state.player.maxGauge;
+      state.cooldowns.Q = 0;
+      this.spawnTutorialSkillTargets();
+      return;
+    }
+
+    if (step.id === "reward") {
+      this.openRewardChoice(3);
+      state.message = "첫 보상 카드를 선택하세요";
+      return;
+    }
+
+    if (step.id === "boss-pose-break") {
+      state.pendingRewardIds = [];
+      state.rewardOfferHistoryIds = [];
+      state.projectiles = [];
+      state.traps = [];
+      state.enemies = [];
+      this.startTutorialBossPoseBreak();
+    }
+  }
+
+  private getCurrentTutorialStep() {
+    return this.state.tutorial.steps[this.state.tutorial.currentStepIndex] ?? null;
+  }
+
+  private currentTutorialStepIs(stepId: TutorialStepId): boolean {
+    return this.state.mode === "tutorial" && this.getCurrentTutorialStep()?.id === stepId;
+  }
+
+  private registerTutorialBasicAttackHit(): void {
+    const state = this.state;
+    if (!this.currentTutorialStepIs("basic-attack")) {
+      return;
+    }
+    state.tutorial.basicAttackHits += 1;
+    this.completeTutorialStep("basic-attack");
+  }
+
+  private spawnTutorialBasicTarget(): void {
+    const player = this.state.player;
+    this.spawnTutorialEnemy("dummy", player.x + 320, player.y - 20, 180);
+  }
+
+  private spawnTutorialSkillTargets(): void {
+    const state = this.state;
+    const player = state.player;
+    const existingTargets = state.enemies.filter((enemy) => enemy.type === "dummy");
+    if (existingTargets.length >= 3) {
+      return;
+    }
+    state.enemies = state.enemies.filter((enemy) => enemy.type !== "dummy");
+    this.spawnTutorialEnemy("dummy", player.x + 330, player.y, 420);
+    this.spawnTutorialEnemy("dummy", player.x + 430, player.y - 84, 420);
+    this.spawnTutorialEnemy("dummy", player.x + 430, player.y + 84, 420);
+  }
+
+  private startTutorialBossPoseBreak(): void {
+    const state = this.state;
+    let boss = this.findBoss("drum");
+    if (!boss) {
+      const player = state.player;
+      boss = this.spawnTutorialEnemy("drum", player.x + 340, player.y, 680);
+    }
+    boss.pulseCooldown = Math.max(boss.pulseCooldown, 5);
+    this.startBossChallenge(boss, {
+      bossType: "drum",
+      sequence: ["cross-guard"],
+      prompt: "팔을 X자로 교차해 드럼 노이즈의 리듬 폭격을 막으세요.",
+      stepPrompts: ["크로스 가드: 양팔을 X자로 교차"],
+      successEffect: "drum-counter",
+      failDamage: 8,
+      duration: 3.4
+    });
+  }
+
+  private spawnTutorialEnemy(type: EnemyType, x: number, y: number, hpOverride?: number): EnemyState {
+    const stats = enemyStats(type, 1);
+    const enemy: EnemyState = {
+      id: this.nextEntityId++,
+      type,
+      x: clamp(x, 90, WORLD_WIDTH - 90),
+      y: clamp(y, 90, WORLD_HEIGHT - 90),
+      radius: stats.radius,
+      hp: hpOverride ?? stats.hp,
+      maxHp: hpOverride ?? stats.hp,
+      speed: type === "dummy" ? 0 : randomRange(stats.speedMin, stats.speedMax),
+      facing: normalize({ x: this.state.player.x - x, y: this.state.player.y - y }),
+      phase: 1,
+      phaseTriggered: { phase2: false, phase3: false },
+      shootCooldown: type === "drum" ? 3.6 : 0,
+      pulseCooldown: type === "drum" ? 5 : 0,
+      markedTime: 0,
+      slowTime: 0,
+      hitFlash: 0
+    };
+    this.state.enemies.push(enemy);
+    this.addUnlockedAchievements(this.progression?.recordEnemySeen(type) ?? []);
+    return enemy;
+  }
+
+  private applyDailySpawnModifiers(queue: EnemyType[]): EnemyType[] {
+    if (this.state.mode === "tutorial" || this.state.mode === "training") {
+      return queue;
+    }
+
+    const next = [...queue];
+    if (this.dailyModifiers.swarmSpawnBonus > 0) {
+      const extraSwarms = Math.max(1, Math.floor(queue.length * this.dailyModifiers.swarmSpawnBonus * 0.45));
+      for (let index = 0; index < extraSwarms; index += 1) {
+        next.push("swarm");
+      }
+    }
+
+    if (this.dailyModifiers.mirrorZeroSpawnBonus > 0) {
+      const disruptors: EnemyType[] = ["castBreaker", "shieldNoise", "anchorNoise"];
+      const extraDisruptors = Math.max(1, Math.floor(queue.length * this.dailyModifiers.mirrorZeroSpawnBonus * 0.28));
+      for (let index = 0; index < extraDisruptors; index += 1) {
+        next.push(disruptors[(this.state.waveIndex + index) % disruptors.length]);
+      }
+    }
+
+    return next;
+  }
+
+  private completeTutorial(): void {
+    const state = this.state;
+    if (state.tutorial.completed) {
+      return;
+    }
+    state.tutorial.completed = true;
+    state.tutorial.bossChallengeCleared = true;
+    state.bossChallenge = null;
+    state.preparedSkill = null;
+    state.pendingRewardIds = [];
+    state.rewardOfferHistoryIds = [];
+    state.victory = true;
+    state.message = "튜토리얼 완료";
+    state.player.score += 850;
+    this.progression?.markTutorialCompleted();
+    this.recordRunEnd(true);
+    this.fxEvents.push({
+      kind: "burst",
+      x: state.player.x,
+      y: state.player.y,
+      radius: 260,
+      color: 0xffd166,
+      grade: "Perfect"
+    });
+    this.fxEvents.push({
+      kind: "float-text",
+      x: state.player.x,
+      y: state.player.y - 148,
+      text: "TUTORIAL CLEAR",
+      color: 0xffd166
+    });
   }
 
   private startNextWave(): void {
@@ -1191,9 +1845,10 @@ export class GameSimulation {
       return;
     }
 
-    state.spawnQueue = [...wavePlans[state.waveIndex]].sort(() => Math.random() - 0.5);
+    state.spawnQueue = this.applyDailySpawnModifiers([...wavePlans[state.waveIndex]]).sort(() => Math.random() - 0.5);
     state.waveIndex += 1;
     state.stageName = state.waveIndex < 5 ? "루프시티 거리" : "드럼 노이즈";
+    this.setStageRegion("루프시티");
     state.waveActive = true;
     state.spawnTimer = 0.25;
     state.player.gauge = clamp(state.player.gauge + 18, 0, state.player.maxGauge);
@@ -1203,6 +1858,7 @@ export class GameSimulation {
   private startSurvival(): void {
     const state = this.state;
     state.stageName = "루프시티 생존";
+    this.setStageRegion("루프시티");
     state.waveIndex = 0;
     state.modeTime = 0;
     state.survivalNextRewardAt = 60;
@@ -1214,7 +1870,7 @@ export class GameSimulation {
   private startSurvivalWave(): void {
     const state = this.state;
     state.waveIndex += 1;
-    state.spawnQueue.push(...makeSurvivalWave(state.waveIndex));
+    state.spawnQueue.push(...this.applyDailySpawnModifiers(makeSurvivalWave(state.waveIndex)));
     state.waveActive = true;
     state.spawnTimer = Math.min(state.spawnTimer, 0.2);
     state.message = `Survival ${state.waveIndex}`;
@@ -1223,6 +1879,7 @@ export class GameSimulation {
   private startBossRush(): void {
     const state = this.state;
     state.stageName = "보스 러시";
+    this.setStageRegion("보스 러시");
     state.waveIndex = 0;
     state.bossRushIndex = 0;
     state.player.gauge = state.player.maxGauge;
@@ -1238,6 +1895,7 @@ export class GameSimulation {
     }
 
     const boss = bossRushPlan[state.bossRushIndex];
+    this.setStageRegion(stageRegionForBoss(boss));
     state.spawnQueue = [boss];
     state.bossRushIndex += 1;
     state.waveIndex = state.bossRushIndex;
@@ -1248,6 +1906,10 @@ export class GameSimulation {
   }
 
   private continueAfterReward(): void {
+    if (this.state.mode === "tutorial") {
+      this.completeTutorialStep("reward");
+      return;
+    }
     if (this.state.mode === "adventure") {
       this.state.adventureStageIndex = Math.min(this.state.adventureStageIndex + 1, ADVENTURE_STAGES.length);
       this.startAdventureStage();
@@ -1285,15 +1947,20 @@ export class GameSimulation {
           : randomRange(margin, WORLD_HEIGHT - margin);
     const waveScale = 1 + (this.state.waveIndex - 1) * 0.15;
     const stats = enemyStats(type, waveScale);
+    const hpMultiplier = isBoss ? this.dailyModifiers.bossHpMultiplier : this.dailyModifiers.enemyHpMultiplier;
+    const hp = Math.round(stats.hp * hpMultiplier);
     const enemy: EnemyState = {
       id: this.nextEntityId++,
       type,
       x,
       y,
       radius: stats.radius,
-      hp: stats.hp,
-      maxHp: stats.hp,
-      speed: randomRange(stats.speedMin, stats.speedMax),
+      hp,
+      maxHp: hp,
+      speed: randomRange(stats.speedMin, stats.speedMax) * this.dailyModifiers.enemySpeedMultiplier,
+      facing: normalize({ x: this.state.player.x - x, y: this.state.player.y - y }),
+      phase: 1,
+      phaseTriggered: { phase2: false, phase3: false },
       shootCooldown: randomRange(0.6, 1.6),
       pulseCooldown: randomRange(1.3, 2.2),
       markedTime: 0,
@@ -1301,10 +1968,7 @@ export class GameSimulation {
       hitFlash: 0
     };
     this.state.enemies.push(enemy);
-    this.progression?.recordEnemySeen(type);
-    if (this.state.dailyChallengeId === "accelerated-noise") {
-      enemy.speed *= 1.22;
-    }
+    this.addUnlockedAchievements(this.progression?.recordEnemySeen(type) ?? []);
     if (type === "drum" || type === "mirror" || type === "zero") {
       this.state.message = bossDisplayName(type);
       this.fxEvents.push({ kind: "sound", sound: "boss" });
@@ -1939,6 +2603,7 @@ export class GameSimulation {
         color: skill.color
       });
     }
+    state.runStats.slimesSummoned += count;
 
     this.fxEvents.push({ kind: "burst", x: player.x, y: player.y, radius: 150, color: skill.color, grade });
   }
@@ -1985,6 +2650,7 @@ export class GameSimulation {
       damage: damage * 0.55 * state.upgrades.bigSlimeDamageMultiplier * state.upgrades.slimeDamageMultiplier,
       color: skill.color
     });
+    state.runStats.slimesSummoned += 1;
 
     const smallCount = (grade === "Perfect" ? 5 : grade === "Great" ? 3 : 2) + state.upgrades.slimePartyBonus;
     for (let index = 0; index < smallCount; index += 1) {
@@ -2000,6 +2666,7 @@ export class GameSimulation {
         color: 0x7dffb2
       });
     }
+    state.runStats.slimesSummoned += smallCount;
 
     this.fxEvents.push({ kind: "burst", x: player.x, y: player.y, radius, color: skill.color, grade });
     this.fxEvents.push({
@@ -2078,190 +2745,301 @@ export class GameSimulation {
   }
 
   private getSkillDamageMultiplier(): number {
-    return this.getGlobalDamageMultiplier() * this.state.upgrades.skillDamageMultiplier;
+    const coreRunaway = this.hasSynergy("core-runaway") && this.state.player.gauge >= 90 ? 1.14 : 1;
+    return this.getGlobalDamageMultiplier() * this.state.upgrades.skillDamageMultiplier * coreRunaway;
+  }
+
+  private getDailySkillCastDamageMultiplier(gestureId: GestureResult["gestureId"], grade: CastGrade): number {
+    const perfect = grade === "Perfect" ? this.dailyModifiers.perfectDamageMultiplier : 1;
+    const oneHand = isOneHandGesture(gestureId) ? this.dailyModifiers.oneHandSkillDamageMultiplier : 1;
+    return perfect * oneHand;
+  }
+
+  private pushPerfectCastPresentation(color: number): void {
+    this.fxEvents.push({ kind: "screen-flash", color, alpha: 0.24, duration: 150 });
+    this.fxEvents.push({ kind: "zoom-pulse", zoom: 1.045, duration: 150 });
+    this.fxEvents.push({ kind: "shake", intensity: 0.006, duration: 70 });
+  }
+
+  private pushCutIn(title: string, subtitle: string, color: number, duration = 600): void {
+    this.fxEvents.push({ kind: "cut-in", title, subtitle, color, duration });
+    this.fxEvents.push({ kind: "screen-flash", color, alpha: 0.2, duration: 180 });
+    this.fxEvents.push({ kind: "zoom-pulse", zoom: 1.075, duration: 220 });
+  }
+
+  private updateSynergies(): void {
+    const state = this.state;
+    const previousIds = new Set(state.activeSynergies.map((synergy) => synergy.id));
+    state.activeSynergies = calculateActiveSynergies(state.characterId, state.runStats.rewardsChosen);
+    const newlyCompleted = state.activeSynergies.filter((synergy) => !previousIds.has(synergy.id));
+    for (const synergy of newlyCompleted) {
+      this.fxEvents.push({
+        kind: "float-text",
+        x: state.player.x,
+        y: state.player.y - 138,
+        text: "BUILD COMPLETE",
+        color: 0xffd166
+      });
+      this.fxEvents.push({
+        kind: "float-text",
+        x: state.player.x,
+        y: state.player.y - 106,
+        text: synergy.title,
+        color: 0x48f7ff
+      });
+      this.pushCutIn("BUILD COMPLETE", synergy.title, 0xffd166, 620);
+      this.fxEvents.push({ kind: "sound", sound: "build-complete" });
+    }
+  }
+
+  private hasSynergy(id: string): boolean {
+    return this.state.activeSynergies.some((synergy) => synergy.id === id);
+  }
+
+  private applyPostSkillSynergy(color: number): void {
+    const state = this.state;
+    if (!this.hasSynergy("rio-delivery-route") || state.player.dashBuffTime <= 0) {
+      return;
+    }
+
+    const targets = [...state.enemies]
+      .filter((enemy) => enemy.type !== "dummy")
+      .map((enemy) => ({ enemy, dist: distance(state.player, enemy) }))
+      .filter((item) => item.dist < 620)
+      .sort((a, b) => a.dist - b.dist)
+      .slice(0, 2);
+
+    for (const { enemy } of targets) {
+      this.damageEnemy(enemy, 22 * this.getGlobalDamageMultiplier(), color, { bypassFrontGuard: true });
+      this.fxEvents.push({
+        kind: "bolt",
+        points: [
+          { x: state.player.x, y: state.player.y },
+          { x: enemy.x, y: enemy.y }
+        ],
+        color: 0xd7ff3f,
+        grade: "Great"
+      });
+    }
+
+    if (targets.length > 0) {
+      this.fxEvents.push({
+        kind: "float-text",
+        x: state.player.x,
+        y: state.player.y - 112,
+        text: "DELIVERY BOLT",
+        color: 0xd7ff3f
+      });
+    }
+  }
+
+  private updateBossPhase(enemy: EnemyState): void {
+    const ratio = enemy.hp / enemy.maxHp;
+    if (ratio <= 0.6 && !enemy.phaseTriggered.phase2) {
+      enemy.phaseTriggered.phase2 = true;
+      enemy.phase = Math.max(enemy.phase, 2);
+      this.triggerBossPhase(enemy, 2);
+    }
+    if (ratio <= 0.25 && !enemy.phaseTriggered.phase3) {
+      enemy.phaseTriggered.phase3 = true;
+      enemy.phase = 3;
+      this.triggerBossPhase(enemy, 3);
+    }
+  }
+
+  private triggerBossPhase(enemy: EnemyState, phase: 2 | 3): void {
+    const color = enemy.type === "drum" ? 0xffd166 : enemy.type === "mirror" ? 0x48f7ff : 0xc7b8ff;
+    const title = `${bossDisplayName(enemy.type)} PHASE ${phase}`;
+    this.state.message = title;
+    enemy.shootCooldown = 0.2;
+    enemy.pulseCooldown = phase === 3 ? 0.25 : Math.min(enemy.pulseCooldown, 1.2);
+    enemy.slowTime = Math.max(enemy.slowTime, 0.9);
+    this.fxEvents.push({
+      kind: "float-text",
+      x: enemy.x,
+      y: enemy.y - 132,
+      text: `PHASE ${phase}`,
+      color
+    });
+    this.fxEvents.push({ kind: "burst", x: enemy.x, y: enemy.y, radius: phase === 3 ? 330 : 240, color, grade: phase === 3 ? "Perfect" : "Great" });
+    this.fxEvents.push({ kind: "shake", intensity: phase === 3 ? 0.022 : 0.015, duration: phase === 3 ? 320 : 220 });
+    this.fxEvents.push({ kind: "sound", sound: "phase-change" });
+
+    if (enemy.type === "drum") {
+      this.spawnDrumWarningCircles(enemy, phase === 3 ? 5 : 4);
+      if (phase === 3) {
+        this.startDrumComboChallenge(enemy);
+      }
+    } else if (enemy.type === "mirror") {
+      if (phase === 2) {
+        this.fireMirrorCopiedSkill(enemy);
+      } else {
+        this.startMirrorPrisonChallenge(enemy);
+      }
+    } else if (enemy.type === "zero") {
+      this.spawnZeroStasisHazards(enemy, phase === 3 ? 3 : 2);
+      if (phase === 3) {
+        this.startZeroFinalChallenge(enemy);
+      }
+    }
+  }
+
+  private spawnDrumWarningCircles(enemy: EnemyState, count: number): void {
+    const player = this.state.player;
+    for (let index = 0; index < count; index += 1) {
+      const angle = (Math.PI * 2 * index) / count + this.state.time * 0.6;
+      const aimed = index === 0;
+      const x = aimed ? player.x : enemy.x + Math.cos(angle) * randomRange(150, 430);
+      const y = aimed ? player.y : enemy.y + Math.sin(angle) * randomRange(120, 340);
+      this.spawnTrap({
+        kind: "drum-warning",
+        x,
+        y,
+        radius: enemy.phase >= 3 ? 122 : 104,
+        damage: enemy.phase >= 3 ? 18 : 14,
+        ttl: enemy.phase >= 3 ? 1.05 : 1.25,
+        color: 0xff7a2f
+      });
+    }
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 98, text: "BEAT DROP", color: 0xff7a2f });
+  }
+
+  private fireMirrorCopiedSkill(enemy: EnemyState): void {
+    const player = this.state.player;
+    const copied = player.lastSkillId ?? "spark-slash";
+    const dir = normalize({ x: player.x - enemy.x, y: player.y - enemy.y });
+    const angle = Math.atan2(dir.y, dir.x);
+
+    if (copied.includes("slash") || copied.includes("cut") || copied.includes("push")) {
+      const length = 720;
+      const width = 110;
+      if (distance(enemy, player) < length && perpendicularDistance(player, enemy, dir) < width) {
+        player.movementSlowTime = Math.max(player.movementSlowTime, 0.9);
+        this.damagePlayer(enemy.phase >= 3 ? 13 : 10);
+      }
+      this.fxEvents.push({ kind: "slash", x: enemy.x, y: enemy.y, angle, length, color: 0xc7b8ff, grade: enemy.phase >= 3 ? "Perfect" : "Great" });
+    } else if (copied.includes("trap") || copied.includes("field") || copied.includes("bomb")) {
+      this.spawnTrap({
+        kind: "noise-trap",
+        x: player.x + randomRange(-80, 80),
+        y: player.y + randomRange(-80, 80),
+        radius: enemy.phase >= 3 ? 168 : 132,
+        damage: enemy.phase >= 3 ? 8 : 5,
+        ttl: 4,
+        color: 0xc7b8ff
+      });
+    } else {
+      this.spawnProjectile({
+        owner: "enemy",
+        x: enemy.x + dir.x * 46,
+        y: enemy.y + dir.y * 46,
+        direction: dir,
+        speed: enemy.phase >= 3 ? 560 : 460,
+        damage: enemy.phase >= 3 ? 12 : 9,
+        radius: enemy.phase >= 3 ? 12 : 9,
+        ttl: 3,
+        color: 0xc7b8ff
+      });
+      this.fxEvents.push({
+        kind: "bolt",
+        points: [
+          { x: enemy.x, y: enemy.y },
+          { x: player.x, y: player.y }
+        ],
+        color: 0x48f7ff,
+        grade: "Great"
+      });
+    }
+
+    this.state.message = `미러 카피: ${copied}`;
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 94, text: "MIRROR COPY", color: 0xc7b8ff });
+  }
+
+  private spawnZeroStasisHazards(enemy: EnemyState, count: number): void {
+    const existing = this.state.stageHazards.filter((hazard) => hazard.kind === "stasis-drain").length;
+    const capacity = Math.max(0, 7 - existing);
+    const total = Math.min(count, capacity);
+    for (let index = 0; index < total; index += 1) {
+      const angle = (Math.PI * 2 * index) / Math.max(1, total) + this.state.time;
+      const source = index === 0 ? this.state.player : enemy;
+      this.state.stageHazards.push(
+        this.createStageHazard(
+          "stasis-drain",
+          clamp(source.x + Math.cos(angle) * randomRange(120, 260), 120, WORLD_WIDTH - 120),
+          clamp(source.y + Math.sin(angle) * randomRange(100, 240), 120, WORLD_HEIGHT - 120),
+          enemy.phase >= 3 ? 168 : 138,
+          enemy.phase >= 3 ? 12 : 8,
+          this.state.time + index
+        )
+      );
+    }
+    if (total > 0) {
+      this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 98, text: "STASIS FIELD", color: 0xc7b8ff });
+    }
+  }
+
+  private startDrumComboChallenge(enemy: EnemyState): boolean {
+    return this.startBossChallenge(enemy, {
+      bossType: "drum",
+      sequence: ["cross-guard", "palm-push"],
+      prompt: "크로스 가드 후 팜 푸시로 피날레 비트를 밀어내세요",
+      stepPrompts: ["팔을 X자로 교차해 피날레 비트를 막으세요", "손바닥을 앞으로 밀어 반격하세요"],
+      successEffect: "drum-combo-counter",
+      failDamage: 24,
+      duration: 2.1
+    });
+  }
+
+  private startMirrorPrisonChallenge(enemy: EnemyState): boolean {
+    return this.startBossChallenge(enemy, {
+      bossType: "mirror",
+      sequence: ["slash", "focus-triangle"],
+      prompt: "슬래시 후 삼각 포커스로 거울 감옥을 깨세요",
+      stepPrompts: ["손을 날카롭게 휘둘러 첫 거울을 깨세요", "양손으로 삼각형을 만들어 감옥 핵을 조준하세요"],
+      successEffect: "mirror-prison-break",
+      failDamage: 8,
+      duration: 2.05
+    });
+  }
+
+  private startZeroFinalChallenge(enemy: EnemyState): boolean {
+    const ultimateGesture = this.getCurrentSkills().F.gestureId;
+    return this.startBossChallenge(enemy, {
+      bossType: "zero",
+      sequence: ["open-arms", "rise", ultimateGesture],
+      prompt: "오픈 암, 라이즈, 궁극기 포즈로 제로 코어를 해방하세요",
+      stepPrompts: ["양팔을 크게 벌려 정지장을 찢으세요", "손을 위로 들어 코어를 끌어올리세요", "캐릭터 궁극기 포즈로 마무리하세요"],
+      successEffect: "zero-final-release",
+      failDamage: 28,
+      duration: 2.25
+    });
   }
 
   private startBossChallenge(
     enemy: EnemyState,
-    challenge: Omit<BossChallengeState, "expiresAt"> & { duration: number }
+    challenge: BossChallengeConfig
   ): boolean {
-    const state = this.state;
-    if (state.bossChallenge || state.gameOver || state.victory || state.pendingRewardIds.length > 0) {
-      return false;
-    }
-
-    state.preparedSkill = null;
-    state.bossChallenge = {
-      bossType: challenge.bossType,
-      requiredGesture: challenge.requiredGesture,
-      prompt: challenge.prompt,
-      expiresAt: state.time + challenge.duration,
-      successEffect: challenge.successEffect,
-      failDamage: challenge.failDamage
-    };
-    state.message = "Boss Pose Break";
-    this.fxEvents.push({ kind: "sound", sound: "boss" });
-    this.fxEvents.push({ kind: "shake", intensity: 0.01, duration: 170 });
-    this.fxEvents.push({
-      kind: "float-text",
-      x: enemy.x,
-      y: enemy.y - 104,
-      text: "POSE BREAK",
-      color: challenge.bossType === "drum" ? 0xffd166 : challenge.bossType === "mirror" ? 0x48f7ff : 0xc7b8ff
-    });
-    return true;
+    return this.bossSystem.startBossChallenge(enemy, challenge);
   }
 
   private succeedBossChallenge(challenge: BossChallengeState, grade: Exclude<CastGrade, "Miss">): CastResponse {
-    const state = this.state;
-    let line = "";
-    if (challenge.successEffect === "drum-counter") {
-      const reflected = this.resolveDrumChallenge(grade);
-      line = grade === "Perfect" ? `리듬 반사 Perfect! ${reflected}발 역반사` : `리듬 반사 성공! ${reflected}발 역반사`;
-    } else if (challenge.successEffect === "mirror-shatter") {
-      const shattered = this.resolveMirrorChallenge(grade);
-      line = grade === "Perfect" ? `거울 분신 완전 파쇄! ${shattered}개 제거` : `거울 분신 파쇄! ${shattered}개 제거`;
-    } else {
-      this.resolveZeroChallenge(grade);
-      line = grade === "Perfect" ? "제로 모션 해방! 잠시 무한 게이지" : "제로 모션 해방! 코어 게이지 회복";
-    }
-
-    state.message = line;
-    this.fxEvents.push({
-      kind: "float-text",
-      x: state.player.x,
-      y: state.player.y - 96,
-      text: grade === "Perfect" ? "PERFECT COUNTER" : "COUNTER",
-      color: grade === "Perfect" ? 0xffd166 : 0x48f7ff
-    });
-    this.fxEvents.push({ kind: "sound", sound: grade === "Perfect" ? "perfect" : "great", grade });
-    return { ok: true, line };
+    return this.bossSystem.succeedBossChallenge(challenge, grade);
   }
 
   private failBossChallenge(challenge: BossChallengeState): CastResponse {
-    const state = this.state;
-    const player = state.player;
-    player.invulnerableTime = 0;
-    player.hurtCooldown = 0;
-
-    if (challenge.bossType === "mirror") {
-      player.controlReverseTime = Math.max(player.controlReverseTime, 3.2);
-      player.movementSlowTime = Math.max(player.movementSlowTime, 1.8);
-      if (challenge.failDamage > 0) {
-        this.damagePlayer(challenge.failDamage);
-      }
-      state.message = "거울 반전: 이동이 뒤틀립니다";
-    } else if (challenge.bossType === "zero") {
-      player.gauge = 0;
-      this.damagePlayer(challenge.failDamage);
-      state.message = "제로 모션: 코어 게이지가 비었습니다";
-      const boss = this.findBoss(challenge.bossType);
-      if (boss) {
-        this.fireZeroMotionPulse(boss);
-      }
-    } else {
-      this.damagePlayer(challenge.failDamage);
-      state.message = "드럼 비트에 밀려났습니다";
-    }
-
-    this.fxEvents.push({
-      kind: "float-text",
-      x: player.x,
-      y: player.y - 92,
-      text: "BREAK FAIL",
-      color: 0xff5ea8
-    });
-    this.fxEvents.push({ kind: "sound", sound: "hit" });
-    return { ok: true, line: state.message };
+    return this.bossSystem.failBossChallenge(challenge);
   }
 
   private resolveDrumChallenge(grade: Exclude<CastGrade, "Miss">): number {
-    const state = this.state;
-    const boss = this.findBoss("drum");
-    const reflectedLimit = grade === "Perfect" ? 10 : grade === "Great" ? 7 : 5;
-    let reflected = 0;
-
-    if (boss) {
-      boss.slowTime = Math.max(boss.slowTime, grade === "Perfect" ? 4 : grade === "Great" ? 3 : 2.2);
-      boss.pulseCooldown = Math.max(boss.pulseCooldown, 4.5);
-      this.damageEnemy(boss, grade === "Perfect" ? 180 : grade === "Great" ? 128 : 88, 0xffd166);
-    }
-
-    for (const projectile of state.projectiles) {
-      if (reflected >= reflectedLimit || projectile.owner !== "enemy") {
-        continue;
-      }
-      if (distance(projectile, state.player) > 760) {
-        continue;
-      }
-      const target = boss ?? state.player;
-      const dir = normalize({ x: target.x - projectile.x, y: target.y - projectile.y });
-      projectile.owner = "player";
-      projectile.vx = dir.x * (grade === "Perfect" ? 620 : 520);
-      projectile.vy = dir.y * (grade === "Perfect" ? 620 : 520);
-      projectile.damage = grade === "Perfect" ? 28 : grade === "Great" ? 22 : 17;
-      projectile.ttl = Math.max(projectile.ttl, 1.4);
-      projectile.color = 0xfff0a3;
-      reflected += 1;
-    }
-
-    if (boss && grade === "Perfect") {
-      for (const enemy of [...state.enemies]) {
-        if (enemy.id !== boss.id && distance(enemy, boss) < 260) {
-          this.damageEnemy(enemy, 54, 0xffd166);
-        }
-      }
-      this.fxEvents.push({ kind: "burst", x: boss.x, y: boss.y, radius: 310, color: 0xffd166, grade });
-      this.fxEvents.push({ kind: "shake", intensity: 0.018, duration: 240 });
-    }
-
-    return reflected;
+    return this.bossSystem.resolveDrumChallenge(grade);
   }
 
   private resolveMirrorChallenge(grade: Exclude<CastGrade, "Miss">): number {
-    const state = this.state;
-    const boss = this.findBoss("mirror");
-    const origin = boss ?? state.player;
-    const limit = grade === "Perfect" ? 8 : grade === "Great" ? 5 : 3;
-    const clones = [...state.enemies]
-      .filter((enemy) => enemy.type === "runner" || enemy.type === "swarm")
-      .map((enemy) => ({ enemy, range: distance(enemy, origin) }))
-      .filter((item) => item.range < 760)
-      .sort((a, b) => a.range - b.range)
-      .slice(0, limit);
-
-    for (const { enemy } of clones) {
-      this.damageEnemy(enemy, enemy.hp + 20, 0x48f7ff);
-    }
-    if (boss) {
-      boss.pulseCooldown = Math.max(boss.pulseCooldown, 4);
-      this.damageEnemy(boss, grade === "Perfect" ? 145 : grade === "Great" ? 105 : 72, 0x48f7ff);
-      this.fxEvents.push({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 260 : 190, color: 0x48f7ff, grade });
-    }
-    if (grade === "Perfect") {
-      state.projectiles = state.projectiles.filter((projectile) => projectile.owner !== "enemy" || distance(projectile, origin) > 540);
-    }
-
-    return clones.length;
+    return this.bossSystem.resolveMirrorChallenge(grade);
   }
 
-  private resolveZeroChallenge(grade: Exclude<CastGrade, "Miss">): void {
-    const state = this.state;
-    const player = state.player;
-    const boss = this.findBoss("zero");
-    player.gauge = clamp(player.gauge + (grade === "Perfect" ? player.maxGauge : grade === "Great" ? 70 : 48), 0, player.maxGauge);
-    if (grade === "Perfect") {
-      player.infiniteGaugeTime = Math.max(player.infiniteGaugeTime, 4.2);
-      for (const slot of Object.keys(state.cooldowns) as SkillSlot[]) {
-        state.cooldowns[slot] = Math.max(0, state.cooldowns[slot] - 2.5);
-      }
-    }
-    if (boss) {
-      boss.pulseCooldown = Math.max(boss.pulseCooldown, 5);
-      this.damageEnemy(boss, grade === "Perfect" ? 160 : grade === "Great" ? 116 : 78, 0xc7b8ff);
-      this.fxEvents.push({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 330 : 230, color: 0xc7b8ff, grade });
-    }
-    this.fxEvents.push({ kind: "shake", intensity: grade === "Perfect" ? 0.02 : 0.012, duration: 240 });
+  private resolveZeroChallenge(grade: Exclude<CastGrade, "Miss">, finalBreak = false): void {
+    this.bossSystem.resolveZeroChallenge(grade, finalBreak);
   }
 
   private findBoss(type: BossChallengeState["bossType"]): EnemyState | null {
@@ -2331,6 +3109,9 @@ export class GameSimulation {
         hp: index === 0 ? 24 : 16,
         maxHp: index === 0 ? 24 : 16,
         speed: index === 0 ? 150 : 188,
+        facing: normalize({ x: state.player.x - enemy.x, y: state.player.y - enemy.y }),
+        phase: 1,
+        phaseTriggered: { phase2: false, phase3: false },
         shootCooldown: 0,
         pulseCooldown: 0,
         markedTime: 0,
@@ -2371,12 +3152,71 @@ export class GameSimulation {
     this.fxEvents.push({ kind: "shake", intensity: 0.014, duration: 180 });
   }
 
-  private damageEnemy(enemy: EnemyState, amount: number, color: number): void {
+  private healNearbyEnemies(source: EnemyState, amount: number, radius: number): number {
+    let healed = 0;
+    for (const enemy of this.state.enemies) {
+      if (enemy.id === source.id || enemy.type === "dummy" || enemy.hp <= 0 || enemy.hp >= enemy.maxHp) {
+        continue;
+      }
+      if (distance(source, enemy) > radius + enemy.radius) {
+        continue;
+      }
+      enemy.hp = clamp(enemy.hp + amount, 0, enemy.maxHp);
+      healed += 1;
+      this.fxEvents.push({
+        kind: "bolt",
+        points: [
+          { x: source.x, y: source.y },
+          { x: enemy.x, y: enemy.y }
+        ],
+        color: 0x7dffb2,
+        grade: "Normal"
+      });
+    }
+
+    if (healed > 0) {
+      this.fxEvents.push({ kind: "burst", x: source.x, y: source.y, radius, color: 0x7dffb2 });
+      this.fxEvents.push({ kind: "float-text", x: source.x, y: source.y - 58, text: "REPAIR", color: 0x7dffb2 });
+    }
+    return healed;
+  }
+
+  private explodeBombNoise(enemy: EnemyState): void {
+    if (!this.state.enemies.some((item) => item.id === enemy.id)) {
+      return;
+    }
+
+    const radius = 168;
+    this.state.enemies = this.state.enemies.filter((item) => item.id !== enemy.id);
+    if (distance(enemy, this.state.player) < radius + this.state.player.radius) {
+      this.damagePlayer(13);
+    }
+
+    for (const other of [...this.state.enemies]) {
+      if (distance(enemy, other) < radius + other.radius) {
+        other.slowTime = Math.max(other.slowTime, 0.55);
+        this.damageEnemy(other, 22, 0xffd166, { source: enemy, bypassFrontGuard: true });
+      }
+    }
+
+    this.fxEvents.push({
+      kind: "burst",
+      x: enemy.x,
+      y: enemy.y,
+      radius,
+      color: 0xffd166,
+      grade: "Great"
+    });
+    this.fxEvents.push({ kind: "shake", intensity: 0.012, duration: 140 });
+    this.fxEvents.push({ kind: "sound", sound: "hit" });
+  }
+
+  private damageEnemy(enemy: EnemyState, amount: number, color: number, options: DamageEnemyOptions = {}): void {
     const wasMarked = enemy.markedTime > 0;
     const typeMultiplier =
       (enemy.type === "runner" || enemy.type === "swarm" ? 1 + this.state.upgrades.swarmDamageBonus : 1) *
       (enemy.type === "tank" || enemy.type === "drum" || enemy.type === "mirror" || enemy.type === "zero" ? 1 + this.state.upgrades.eliteDamageBonus : 1);
-    const finalAmount = amount * typeMultiplier;
+    const finalAmount = this.applyEnemyDefense(enemy, amount * typeMultiplier, options);
     enemy.hp -= finalAmount;
     enemy.hitFlash = 0.12;
     if (this.state.upgrades.enemySlowOnHitTime > 0) {
@@ -2402,9 +3242,29 @@ export class GameSimulation {
         });
         return;
       }
+      if (enemy.type === "bombNoise") {
+        this.explodeBombNoise(enemy);
+        this.state.runStats.kills += 1;
+        if (wasMarked) {
+          this.state.runStats.markedEnemyKills += 1;
+        }
+        this.state.player.score += Math.round(
+          scoreForEnemy(enemy.type) * this.getDailyEnemyScoreMultiplier(enemy.type) * this.state.upgrades.scoreMultiplier
+        );
+        this.state.player.gauge = clamp(this.state.player.gauge + gaugeForEnemy(enemy.type) * this.state.upgrades.gaugeGainMultiplier, 0, this.state.player.maxGauge);
+        return;
+      }
       this.state.enemies = this.state.enemies.filter((item) => item.id !== enemy.id);
       this.state.runStats.kills += 1;
-      this.state.player.score += Math.round(scoreForEnemy(enemy.type) * (this.state.dailyChallengeId === "accelerated-noise" ? 1.2 : 1) * this.state.upgrades.scoreMultiplier);
+      if (wasMarked) {
+        this.state.runStats.markedEnemyKills += 1;
+      }
+      if (isBossEnemy(enemy.type) && !this.state.runStats.bossesDefeated.includes(enemy.type)) {
+        this.state.runStats.bossesDefeated.push(enemy.type);
+      }
+      this.state.player.score += Math.round(
+        scoreForEnemy(enemy.type) * this.getDailyEnemyScoreMultiplier(enemy.type) * this.state.upgrades.scoreMultiplier
+      );
       this.state.player.gauge = clamp(
         this.state.player.gauge + gaugeForEnemy(enemy.type) * this.state.upgrades.gaugeGainMultiplier,
         0,
@@ -2416,6 +3276,29 @@ export class GameSimulation {
           this.state.cooldowns[slot] = Math.max(0, this.state.cooldowns[slot] - this.state.upgrades.markedKillCooldownRefund);
         }
       }
+      if (wasMarked && this.hasSynergy("neon-glitch-executor")) {
+        const nextTarget = this.findNearestEnemy(enemy, 460);
+        if (nextTarget && nextTarget.id !== enemy.id) {
+          nextTarget.markedTime = Math.max(nextTarget.markedTime, 5.5);
+          nextTarget.slowTime = Math.max(nextTarget.slowTime, 0.45);
+          this.fxEvents.push({
+            kind: "bolt",
+            points: [
+              { x: enemy.x, y: enemy.y },
+              { x: nextTarget.x, y: nextTarget.y }
+            ],
+            color: 0xff5ea8,
+            grade: "Great"
+          });
+          this.fxEvents.push({
+            kind: "float-text",
+            x: nextTarget.x,
+            y: nextTarget.y - 54,
+            text: "MARK SHIFT",
+            color: 0xff5ea8
+          });
+        }
+      }
       this.fxEvents.push({
         kind: "float-text",
         x: enemy.x,
@@ -2425,6 +3308,29 @@ export class GameSimulation {
       });
       this.fxEvents.push({ kind: "sound", sound: "enemy-down" });
     }
+  }
+
+  private applyEnemyDefense(enemy: EnemyState, amount: number, options: DamageEnemyOptions): number {
+    if (enemy.type !== "shieldNoise") {
+      return amount;
+    }
+
+    if (options.bypassFrontGuard) {
+      return amount * 1.22;
+    }
+
+    const source = options.source ?? this.state.player;
+    const attackDirection = normalize({ x: source.x - enemy.x, y: source.y - enemy.y });
+    const frontal = dot(enemy.facing, attackDirection) > 0.48;
+    if (!frontal) {
+      return amount * 1.15;
+    }
+
+    if (enemy.pulseCooldown <= 0.12) {
+      this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 58, text: "BLOCK", color: 0x48f7ff });
+      enemy.pulseCooldown = 0.35;
+    }
+    return amount * 0.42;
   }
 
   private damagePlayer(amount: number): void {
@@ -2441,6 +3347,10 @@ export class GameSimulation {
     const shieldDamage = Math.min(player.shield, amount);
     player.shield -= shieldDamage;
     player.hp = clamp(player.hp - (amount - shieldDamage), 0, player.maxHp);
+    this.state.runStats.shieldDamageAbsorbed += Math.round(shieldDamage);
+    if (this.state.mode === "tutorial") {
+      player.hp = Math.max(player.hp, 35);
+    }
     this.state.runStats.damageTaken += Math.round(Math.max(0, shieldBefore - player.shield) + Math.max(0, hpBefore - player.hp));
     player.hurtCooldown = 0.7;
     this.fxEvents.push({
@@ -2464,6 +3374,7 @@ export class GameSimulation {
       return;
     }
     this.runReported = true;
+    this.state.runStats.dailyChallengeCleared = victory && this.state.mode !== "tutorial";
     const summary = this.progression?.recordRun({
       characterId: this.state.characterId,
       mode: this.state.mode,
@@ -2471,7 +3382,13 @@ export class GameSimulation {
       score: this.state.player.score,
       seconds: this.state.modeTime || this.state.time,
       hpRatio: this.state.player.hp / this.state.player.maxHp,
-      bossClear: victory && this.state.mode !== "survival"
+      bossClear: victory && this.state.mode !== "survival" && this.state.mode !== "tutorial",
+      misses: this.state.runStats.misses,
+      bossPosePerfectCounters: this.state.runStats.bossPosePerfectCounters,
+      shieldDamageAbsorbed: this.state.runStats.shieldDamageAbsorbed,
+      markedEnemyKills: this.state.runStats.markedEnemyKills,
+      slimesSummoned: this.state.runStats.slimesSummoned,
+      bossesDefeated: this.state.runStats.bossesDefeated
     });
     if (!summary) {
       return;
@@ -2481,6 +3398,7 @@ export class GameSimulation {
     this.state.runStats.levelBefore = summary.levelBefore;
     this.state.runStats.levelAfter = summary.levelAfter;
     this.state.runStats.unlockedItems = summary.unlockedItems;
+    this.addUnlockedAchievements(summary.unlockedAchievements);
     this.state.player.level = summary.levelAfter;
     this.fxEvents.push({
       kind: "float-text",
@@ -2489,6 +3407,34 @@ export class GameSimulation {
       text: summary.levelAfter > summary.levelBefore ? `LV ${summary.levelAfter}` : `XP +${summary.xpGained}`,
       color: summary.levelAfter > summary.levelBefore ? 0xffd166 : 0x48f7ff
     });
+  }
+
+  private getDailyEnemyScoreMultiplier(type: EnemyType): number {
+    return isBossEnemy(type) ? this.dailyModifiers.bossScoreMultiplier : 1;
+  }
+
+  private addUnlockedAchievements(achievements: AchievementUnlock[]): void {
+    for (const achievement of achievements) {
+      if (this.state.runStats.unlockedAchievements.some((item) => item.id === achievement.id)) {
+        continue;
+      }
+      this.state.runStats.unlockedAchievements.push(achievement);
+      this.fxEvents.push({
+        kind: "float-text",
+        x: this.state.player.x,
+        y: this.state.player.y - 154,
+        text: "ACHIEVEMENT",
+        color: 0xffd166
+      });
+      this.fxEvents.push({
+        kind: "float-text",
+        x: this.state.player.x,
+        y: this.state.player.y - 122,
+        text: achievement.title,
+        color: 0x48f7ff
+      });
+      this.fxEvents.push({ kind: "sound", sound: "unlock" });
+    }
   }
 
   private findNearestEnemy(origin: Vector2, maxDistance: number): EnemyState | null {
@@ -2504,249 +3450,18 @@ export class GameSimulation {
     return best;
   }
 
-  private rollRewards(count: number): string[] {
-    const selected: RewardDefinition[] = [];
-    const isAvailable = (reward: RewardDefinition) =>
-      (reward.characterId === null || reward.characterId === this.state.characterId) &&
-      (this.state.rewardStacks[reward.id] ?? 0) < reward.maxStacks &&
-      !selected.some((item) => item.id === reward.id);
-
-    while (selected.length < count) {
-      const characterPool = REWARDS.filter((reward) => reward.characterId === this.state.characterId && isAvailable(reward));
-      const allPool = REWARDS.filter(isAvailable);
-      if (allPool.length === 0) {
-        break;
-      }
-
-      const preferCharacterCard = characterPool.length > 0 && Math.random() < 0.45;
-      selected.push(pickWeightedReward(preferCharacterCard ? characterPool : allPool));
-    }
-
-    return selected.map((reward) => reward.id);
+  private openRewardChoice(count: number): void {
+    const rewardIds = this.rollRewards(count);
+    this.state.pendingRewardIds = rewardIds;
+    this.state.rewardOfferHistoryIds = [...rewardIds];
   }
 
-  private applyReward(rewardId: string): void {
-    const state = this.state;
-    const reward = getRewardDefinition(rewardId);
-    if (!reward) {
-      return;
-    }
+  private rollRewards(count: number, excludedIds: string[] = []): string[] {
+    return rollRewardsForState(this.state, count, excludedIds);
+  }
 
-    state.rewardStacks[rewardId] = (state.rewardStacks[rewardId] ?? 0) + 1;
-    switch (rewardId) {
-      case "forked-slash":
-        state.upgrades.slashDamageMultiplier += 0.2;
-        state.upgrades.slashExtraBurstDamageMultiplier += 0.2;
-        break;
-      case "perfect-tempo":
-        state.upgrades.perfectCooldownRefund = Math.max(state.upgrades.perfectCooldownRefund, 0.35);
-        break;
-      case "runner-current":
-        state.upgrades.dashSkillDamageMultiplier += 0.25;
-        break;
-      case "noise-absorb":
-        state.upgrades.gaugeGainMultiplier += 0.45;
-        break;
-      case "chain-overload":
-        state.upgrades.chainExtraTargets += 2;
-        break;
-      case "spark-hands":
-        state.upgrades.basicAttackRateMultiplier += 0.18;
-        state.upgrades.basicProjectileSpeedMultiplier += 0.1;
-        break;
-      case "delivery-guard":
-        state.upgrades.dashShield += 18;
-        break;
-      case "charged-heart":
-        state.player.maxHp += 20;
-        state.player.hp = clamp(state.player.hp + 20, 0, state.player.maxHp);
-        break;
-      case "overdrive-loop":
-        state.upgrades.overdriveDurationBonus += 2;
-        state.upgrades.overdriveDamageMultiplier += 0.15;
-        break;
-      case "combo-battery":
-        state.upgrades.perfectGaugeBonus += 10;
-        state.player.gauge = clamp(state.player.gauge + 18, 0, state.player.maxGauge);
-        break;
-      case "motion-resonance":
-        state.upgrades.globalDamageMultiplier += 0.12;
-        break;
-      case "core-pocket":
-        state.player.maxGauge += 20;
-        state.player.gauge = clamp(state.player.gauge + 20, 0, state.player.maxGauge);
-        break;
-      case "quick-reset":
-        state.upgrades.cooldownMultiplier *= 0.92;
-        break;
-      case "cast-amplifier":
-        state.upgrades.skillDamageMultiplier += 0.16;
-        break;
-      case "wide-gesture":
-        state.upgrades.areaMultiplier *= 1.1;
-        break;
-      case "safe-failure":
-        state.upgrades.missCooldownMultiplier *= 0.65;
-        break;
-      case "last-stand":
-        state.upgrades.lowHpDamageBonus += 0.28;
-        break;
-      case "kinetic-heal":
-        state.upgrades.dashHeal += 2;
-        state.upgrades.dashShield += 5;
-        break;
-      case "shield-spark":
-        state.upgrades.shieldedDamageBonus += 0.18;
-        break;
-      case "focus-route":
-        state.upgrades.sameSkillDamageBonus += 0.08;
-        break;
-      case "rapid-reload":
-        state.upgrades.basicAttackRateMultiplier += 0.25;
-        break;
-      case "battery-heart":
-        state.player.maxHp += 10;
-        state.player.hp = clamp(state.player.hp + 10, 0, state.player.maxHp);
-        state.player.maxGauge += 10;
-        state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
-        break;
-      case "perfect-discipline":
-        state.upgrades.perfectGaugeBonus += 8;
-        break;
-      case "wave-cleaner":
-        state.upgrades.swarmDamageBonus += 0.24;
-        break;
-      case "elite-hunter":
-        state.upgrades.eliteDamageBonus += 0.22;
-        break;
-      case "score-hunter":
-        state.upgrades.scoreMultiplier += 0.2;
-        state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
-        break;
-      case "thunder-fork":
-        state.upgrades.chainDamageMultiplier += 0.18;
-        state.upgrades.chainDecayMultiplier = Math.min(0.98, state.upgrades.chainDecayMultiplier + 0.03);
-        break;
-      case "courier-boosters":
-        state.upgrades.dashLengthMultiplier *= 1.2;
-        state.upgrades.dashStrikeWidthMultiplier *= 1.1;
-        break;
-      case "blue-afterimage":
-        state.upgrades.slashRangeMultiplier *= 1.16;
-        state.upgrades.slashWidthMultiplier *= 1.12;
-        break;
-      case "static-routing":
-        state.upgrades.chainExtraTargets += 1;
-        state.upgrades.chainDamageMultiplier += 0.08;
-        break;
-      case "voltage-rush":
-        state.upgrades.dashSkillDamageMultiplier += 0.2;
-        break;
-      case "air-splitting-slash":
-        state.upgrades.slashDamageMultiplier += 0.14;
-        state.upgrades.slashExtraBurstDamageMultiplier += 0.25;
-        break;
-      case "lightning-parcel":
-        state.upgrades.dashSkillDamageMultiplier += 0.2;
-        state.upgrades.dashGaugeGain += 4;
-        break;
-      case "overdrive-battery":
-        state.upgrades.overdriveGaugeRefund += 12;
-        state.upgrades.overdriveDurationBonus += 1;
-        break;
-      case "oni-brace":
-        state.upgrades.guardShieldMultiplier *= 1.25;
-        break;
-      case "rebound-practice":
-        state.upgrades.reflectDamageBonus += 12;
-        state.upgrades.guardChargeMultiplier += 0.18;
-        break;
-      case "fortress-heart":
-        state.upgrades.shieldedDamageBonus += 0.22;
-        break;
-      case "push-wave":
-        state.upgrades.shieldPushRangeMultiplier *= 1.15;
-        state.upgrades.pushKnockbackMultiplier *= 1.3;
-        break;
-      case "ground-resonance":
-        state.upgrades.earthDrumRadiusMultiplier *= 1.18;
-        state.upgrades.earthDrumDamageMultiplier += 0.1;
-        break;
-      case "wall-tax":
-        state.upgrades.shieldWallDurationBonus += 1.5;
-        state.upgrades.shieldWallReflectBonus += 15;
-        break;
-      case "guardian-oath":
-        state.upgrades.guardHeal += 4;
-        break;
-      case "shield-carpenter":
-        state.player.maxHp += 15;
-        state.player.hp = clamp(state.player.hp + 15, 0, state.player.maxHp);
-        state.upgrades.guardShieldMultiplier *= 1.1;
-        state.upgrades.dashShield += 6;
-        break;
-      case "mark-cache":
-        state.upgrades.markExtraTargets += 1;
-        break;
-      case "glitch-refund":
-        state.upgrades.markedKillCooldownRefund += 0.35;
-        state.upgrades.markedKillGaugeBonus += 5;
-        break;
-      case "trap-stack":
-        state.upgrades.trapRadiusMultiplier *= 1.14;
-        state.upgrades.trapTtlBonus += 1;
-        break;
-      case "silent-execute":
-        state.upgrades.shadowCutDamageMultiplier += 0.22;
-        state.upgrades.markedDamageMultiplier += 0.12;
-        break;
-      case "blackout-script":
-        state.upgrades.blackoutRadiusMultiplier *= 1.12;
-        state.upgrades.blackoutSlowBonus += 1.2;
-        break;
-      case "mirror-bug":
-        state.upgrades.markDurationBonus += 2;
-        state.upgrades.markDamageMultiplier += 0.12;
-        break;
-      case "cut-through":
-        state.upgrades.shadowCutExtraTargets += 1;
-        break;
-      case "system-lag":
-        state.upgrades.enemySlowOnHitTime += 0.35;
-        break;
-      case "extra-slime":
-        state.upgrades.slimeSummonBonus += 1;
-        break;
-      case "jelly-splash":
-        state.upgrades.jellyRadiusMultiplier *= 1.14;
-        state.upgrades.jellyDamageMultiplier += 0.1;
-        break;
-      case "sweet-recovery":
-        state.upgrades.jellyHealBonus += 5;
-        state.upgrades.sweetFieldHealBonus += 5;
-        break;
-      case "slime-chef":
-        state.upgrades.slimeDamageMultiplier += 0.18;
-        state.upgrades.slimeTtlBonus += 2;
-        break;
-      case "party-leftovers":
-        state.upgrades.slimePartyBonus += 2;
-        break;
-      case "sticky-syrup":
-        state.upgrades.enemySlowOnHitTime += 0.45;
-        state.upgrades.sweetFieldRadiusMultiplier *= 1.08;
-        break;
-      case "bouncing-bomb":
-        state.upgrades.jellySweetFieldRadius += 80;
-        break;
-      case "giant-recipe":
-        state.upgrades.bigSlimeDamageMultiplier += 0.25;
-        state.upgrades.bigSlimeTtlBonus += 2;
-        break;
-      default:
-        break;
-    }
-    this.fxEvents.push({ kind: "sound", sound: "reward" });
+  private applyReward(rewardId: string) {
+    return applyRewardToState(this.state, rewardId);
   }
 
   moveInputFromBooleans(left: boolean, right: boolean, up: boolean, down: boolean): MoveInput {
@@ -2757,50 +3472,31 @@ export class GameSimulation {
   }
 }
 
-function pickWeightedReward(pool: RewardDefinition[]): RewardDefinition {
-  const totalWeight = pool.reduce((sum, reward) => sum + rarityWeight(reward.rarity), 0);
-  let roll = Math.random() * totalWeight;
-  for (const reward of pool) {
-    roll -= rarityWeight(reward.rarity);
-    if (roll <= 0) {
-      return reward;
-    }
+function castGradeSound(grade: CastGrade): SoundId {
+  if (grade === "Perfect") {
+    return "cast-perfect";
   }
-  return pool[pool.length - 1];
+  if (grade === "Great") {
+    return "cast-great";
+  }
+  if (grade === "Normal") {
+    return "cast-normal";
+  }
+  return "hit";
 }
 
-function rarityWeight(rarity: RewardRarity): number {
-  switch (rarity) {
-    case "legendary":
-      return 0.08;
-    case "epic":
-      return 0.18;
-    case "rare":
-      return 0.42;
-    case "uncommon":
-      return 0.74;
-    case "common":
+function characterSkillSound(characterId: CharacterId): SoundId {
+  switch (characterId) {
+    case "maru":
+      return "maru-skill";
+    case "neon":
+      return "neon-skill";
+    case "cookie":
+      return "cookie-skill";
+    case "rio":
     default:
-      return 1;
+      return "rio-skill";
   }
-}
-
-function makeSurvivalWave(wave: number): EnemyType[] {
-  const count = Math.min(24, 7 + wave * 2);
-  const pool: EnemyType[] =
-    wave < 3
-      ? ["runner", "runner", "swarm", "shooter"]
-      : wave < 6
-        ? ["runner", "swarm", "swarm", "shooter", "tank"]
-        : ["runner", "swarm", "shooter", "tank", "mirror"];
-  const enemies: EnemyType[] = [];
-  for (let index = 0; index < count; index += 1) {
-    enemies.push(pool[Math.floor(Math.random() * pool.length)]);
-  }
-  if (wave > 0 && wave % 4 === 0) {
-    enemies.push(wave >= 8 ? "mirror" : "drum");
-  }
-  return enemies;
 }
 
 function bossDisplayName(type: EnemyType): string {
@@ -2816,72 +3512,39 @@ function bossDisplayName(type: EnemyType): string {
   }
 }
 
+function isOneHandGesture(gestureId: GestureResult["gestureId"]): boolean {
+  return (
+    gestureId === "slash" ||
+    gestureId === "thrust" ||
+    gestureId === "rise" ||
+    gestureId === "circle" ||
+    gestureId === "point" ||
+    gestureId === "wave"
+  );
+}
+
+function stageRegionForBoss(type: EnemyType): StageRegion {
+  switch (type) {
+    case "mirror":
+      return "미러 타워";
+    case "zero":
+      return "제로 존";
+    case "drum":
+    default:
+      return "루프시티";
+  }
+}
+
+function isStageHazardActive(hazard: StageHazardState, time: number): boolean {
+  if (hazard.kind === "rotator") {
+    return Math.sin(time * 1.75 + hazard.phase) > -0.25;
+  }
+  if (hazard.kind === "mirror-reversal") {
+    return ((time + hazard.phase) % 4.8) < 1.18;
+  }
+  return true;
+}
+
 function isGuardSkill(skillId: string): boolean {
   return skillId === "dokkaebi-guard" || skillId === "giant-shield-wall" || skillId === "shield-push";
-}
-
-function enemyStats(type: EnemyType, waveScale: number): { radius: number; hp: number; speedMin: number; speedMax: number } {
-  switch (type) {
-    case "dummy":
-      return { radius: 34, hp: 500 * waveScale, speedMin: 0, speedMax: 0 };
-    case "swarm":
-      return { radius: 15, hp: 18 * waveScale, speedMin: 150, speedMax: 188 };
-    case "shooter":
-      return { radius: 24, hp: 46 * waveScale, speedMin: 62, speedMax: 82 };
-    case "tank":
-      return { radius: 32, hp: 92 * waveScale, speedMin: 46, speedMax: 58 };
-    case "drum":
-      return { radius: 58, hp: 420 * waveScale, speedMin: 34, speedMax: 45 };
-    case "mirror":
-      return { radius: 52, hp: 460 * waveScale, speedMin: 64, speedMax: 86 };
-    case "zero":
-      return { radius: 72, hp: 680 * waveScale, speedMin: 24, speedMax: 36 };
-    case "runner":
-    default:
-      return { radius: 21, hp: 28 * waveScale, speedMin: 105, speedMax: 135 };
-  }
-}
-
-function scoreForEnemy(type: EnemyType): number {
-  switch (type) {
-    case "dummy":
-      return 0;
-    case "swarm":
-      return 45;
-    case "shooter":
-      return 130;
-    case "tank":
-      return 210;
-    case "drum":
-      return 1500;
-    case "mirror":
-      return 1800;
-    case "zero":
-      return 2600;
-    case "runner":
-    default:
-      return 80;
-  }
-}
-
-function gaugeForEnemy(type: EnemyType): number {
-  switch (type) {
-    case "dummy":
-      return 0;
-    case "swarm":
-      return 4;
-    case "shooter":
-      return 11;
-    case "tank":
-      return 16;
-    case "drum":
-      return 100;
-    case "mirror":
-      return 100;
-    case "zero":
-      return 100;
-    case "runner":
-    default:
-      return 7;
-  }
 }

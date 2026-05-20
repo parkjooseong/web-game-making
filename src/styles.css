@@ -52,6 +52,7 @@ canvas {
 .skill-slot,
 .gauge-chip,
 .adventure-banner,
+.tutorial-panel,
 .boss-challenge-prompt,
 .training-panel,
 .cast-prompt,
@@ -267,11 +268,22 @@ canvas {
 }
 
 .combo-text,
+.build-text,
 .overdrive-text {
   margin-top: 10px;
   color: var(--gold);
   font-size: 0.8rem;
   font-weight: 800;
+}
+
+.build-text {
+  max-width: 236px;
+  margin-top: 5px;
+  overflow: hidden;
+  color: var(--cyan);
+  font-size: 0.68rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .character-switch {
@@ -346,6 +358,17 @@ canvas {
 .mode-button.is-active {
   color: #071018;
   background: var(--gold);
+}
+
+.sound-button {
+  min-width: 88px;
+  border-color: color-mix(in srgb, var(--cyan), transparent 42%);
+}
+
+.sound-button.is-muted {
+  color: var(--muted);
+  border-color: rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.035);
 }
 
 .skill-dock {
@@ -507,6 +530,81 @@ canvas {
   background: linear-gradient(90deg, var(--pink), var(--gold), var(--lime));
 }
 
+.tutorial-panel {
+  position: absolute;
+  top: 18px;
+  left: 50%;
+  display: none;
+  width: min(520px, calc(100vw - 580px));
+  min-width: 320px;
+  border-color: color-mix(in srgb, var(--cyan), transparent 35%);
+  border-radius: 8px;
+  padding: 14px 16px 15px;
+  text-align: center;
+  transform: translateX(-50%);
+}
+
+.tutorial-panel.is-visible {
+  display: block;
+}
+
+.tutorial-kicker {
+  color: var(--pink);
+  font-size: 0.68rem;
+  font-weight: 900;
+  letter-spacing: 0.08em;
+}
+
+.tutorial-panel strong {
+  display: block;
+  margin-top: 4px;
+  color: var(--gold);
+  font-size: 1.16rem;
+  font-weight: 900;
+}
+
+.tutorial-panel span {
+  display: block;
+  margin-top: 8px;
+  color: var(--text);
+  font-size: 0.95rem;
+  font-weight: 900;
+  line-height: 1.36;
+}
+
+.tutorial-panel p {
+  margin: 7px 0 0;
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.tutorial-panel small {
+  display: block;
+  margin-top: 8px;
+  color: var(--cyan);
+  font-size: 0.72rem;
+  font-weight: 900;
+}
+
+.tutorial-progress {
+  position: relative;
+  height: 6px;
+  margin-top: 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.14);
+}
+
+.tutorial-progress i {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--gold), var(--lime));
+  box-shadow: 0 0 22px rgba(72, 247, 255, 0.42);
+}
+
 .boss-challenge-prompt {
   position: absolute;
   top: 92px;
@@ -604,6 +702,7 @@ canvas {
 .training-mission,
 .training-mission > div,
 .training-last,
+.training-breakdown,
 .training-camera-guide {
   display: grid;
 }
@@ -645,6 +744,7 @@ canvas {
 
 .training-summary div,
 .training-last,
+.training-breakdown,
 .training-camera-guide,
 .training-mission {
   border: 1px solid rgba(255, 255, 255, 0.12);
@@ -689,6 +789,7 @@ canvas {
 }
 
 .training-last,
+.training-breakdown,
 .training-camera-guide {
   gap: 5px;
   margin-top: 9px;
@@ -696,9 +797,57 @@ canvas {
 }
 
 .training-last b,
+.training-breakdown > strong,
 .training-camera-guide strong {
   color: var(--text);
   font-size: 0.82rem;
+}
+
+.training-breakdown-row {
+  display: grid;
+  grid-template-columns: 38px minmax(0, 1fr) 30px;
+  align-items: center;
+  gap: 7px;
+  min-height: 18px;
+}
+
+.training-breakdown-row span,
+.training-breakdown-row strong {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 900;
+}
+
+.training-breakdown-row i {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.training-breakdown-row b {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--gold));
+}
+
+.training-breakdown p {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 0.72rem;
+  font-weight: 850;
+  line-height: 1.35;
+}
+
+.training-breakdown p.is-important {
+  border-radius: 8px;
+  padding: 8px;
+  color: #071018;
+  background: var(--gold);
+  font-size: 0.82rem;
+  font-weight: 950;
 }
 
 .training-camera-guide strong {
@@ -1036,6 +1185,125 @@ canvas {
   transform: translateX(-50%) translateY(0);
 }
 
+.reward-log-panel {
+  position: absolute;
+  top: 132px;
+  left: 14px;
+  display: none;
+  width: min(340px, calc(100vw - 28px));
+  max-height: calc(100vh - 250px);
+  overflow: auto;
+  border: 1px solid rgba(255, 209, 102, 0.3);
+  border-radius: 8px;
+  padding: 12px;
+  background: rgba(7, 13, 22, 0.9);
+  box-shadow: 0 16px 46px rgba(0, 0, 0, 0.38);
+  pointer-events: auto;
+}
+
+.reward-log-panel.is-visible {
+  display: block;
+}
+
+.reward-log-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.reward-log-header.is-sub {
+  margin-top: 12px;
+}
+
+.reward-log-header strong {
+  color: var(--gold);
+  font-size: 0.82rem;
+  font-weight: 950;
+}
+
+.reward-log-header span {
+  border: 1px solid rgba(255, 255, 255, 0.15);
+  border-radius: 999px;
+  padding: 4px 7px;
+  color: var(--muted);
+  font-size: 0.64rem;
+  font-weight: 900;
+}
+
+.reward-log-panel ul {
+  display: grid;
+  gap: 7px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.reward-log-panel li {
+  display: flex;
+  gap: 8px;
+  min-width: 0;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255, 255, 255, 0.045);
+}
+
+.reward-log-panel li > i {
+  display: inline-grid;
+  flex: 0 0 54px;
+  height: 22px;
+  place-items: center;
+  border-radius: 999px;
+  color: #071018;
+  background: var(--cyan);
+  font-size: 0.58rem;
+  font-style: normal;
+  font-weight: 950;
+}
+
+.reward-log-panel li.rarity-uncommon > i {
+  background: var(--lime);
+}
+
+.reward-log-panel li.rarity-rare > i,
+.reward-log-panel li.rarity-legendary > i {
+  background: var(--gold);
+}
+
+.reward-log-panel li.rarity-epic > i {
+  background: #c7b8ff;
+}
+
+.reward-log-panel li div {
+  min-width: 0;
+}
+
+.reward-log-panel li strong,
+.reward-log-panel li span {
+  display: block;
+}
+
+.reward-log-panel li strong {
+  color: var(--text);
+  font-size: 0.76rem;
+  line-height: 1.25;
+}
+
+.reward-log-panel li strong b {
+  color: var(--gold);
+  font-size: 0.68rem;
+}
+
+.reward-log-panel li span {
+  margin-top: 3px;
+  color: var(--muted);
+  font-size: 0.66rem;
+  font-weight: 800;
+  line-height: 1.3;
+}
+
 .hub-overlay,
 .reward-overlay,
 .modal-overlay {
@@ -1097,6 +1365,7 @@ canvas {
 }
 
 .hub-close,
+.hub-tutorial,
 .hub-training,
 .hub-adventure,
 .adventure-stage-card,
@@ -1107,6 +1376,7 @@ canvas {
 }
 
 .hub-close,
+.hub-tutorial,
 .hub-training,
 .hub-adventure {
   min-height: 34px;
@@ -1121,6 +1391,10 @@ canvas {
 
 .hub-adventure {
   background: var(--cyan);
+}
+
+.hub-tutorial {
+  background: var(--lime);
 }
 
 .hub-grid {
@@ -1162,6 +1436,33 @@ canvas {
   line-height: 1.4;
 }
 
+.daily-section {
+  background:
+    linear-gradient(145deg, rgba(255, 209, 102, 0.12), rgba(72, 247, 255, 0.055)),
+    rgba(255, 255, 255, 0.045);
+}
+
+.daily-effect-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+  margin: 12px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.daily-effect-list li {
+  min-width: 0;
+  border: 1px solid rgba(255, 209, 102, 0.28);
+  border-radius: 6px;
+  padding: 6px 8px;
+  background: rgba(4, 12, 22, 0.38);
+  color: #fff2c7;
+  font-size: 0.71rem;
+  font-weight: 800;
+  line-height: 1.25;
+}
+
 .hub-hero {
   background: linear-gradient(145deg, rgba(72, 247, 255, 0.14), rgba(255, 94, 168, 0.08));
 }
@@ -1186,6 +1487,7 @@ canvas {
   background: linear-gradient(90deg, var(--cyan), var(--gold));
 }
 
+.hub-facilities .hub-tutorial,
 .hub-facilities .hub-training,
 .hub-facilities .hub-adventure {
   margin-top: 12px;
@@ -1258,6 +1560,18 @@ canvas {
 .core-card.is-equipped {
   border-color: var(--gold);
   background: rgba(255, 209, 102, 0.12);
+}
+
+.core-card.is-locked {
+  border-color: rgba(255, 255, 255, 0.12);
+  background: rgba(8, 14, 22, 0.68);
+  opacity: 0.76;
+}
+
+.core-card.is-locked small,
+.skin-card.is-locked small,
+.effect-card.is-locked small {
+  color: var(--gold);
 }
 
 .adventure-map-grid {
@@ -1347,10 +1661,18 @@ canvas {
   grid-template-columns: repeat(3, minmax(0, 1fr));
 }
 
+.achievement-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 10px;
+}
+
 .skin-card,
 .effect-card,
 .story-card,
-.codex-card {
+.codex-card,
+.achievement-card {
   min-width: 0;
   border: 1px solid rgba(255, 255, 255, 0.16);
   border-radius: 8px;
@@ -1358,6 +1680,77 @@ canvas {
   color: var(--text);
   background: rgba(8, 14, 22, 0.76);
   text-align: left;
+}
+
+.achievement-card {
+  position: relative;
+  min-height: 146px;
+  background: linear-gradient(145deg, rgba(255, 209, 102, 0.08), rgba(8, 14, 22, 0.82));
+}
+
+.achievement-card.is-complete {
+  border-color: rgba(255, 209, 102, 0.58);
+  box-shadow: inset 0 0 0 1px rgba(255, 209, 102, 0.14);
+}
+
+.achievement-card i {
+  display: inline-grid;
+  min-width: 54px;
+  height: 24px;
+  place-items: center;
+  border-radius: 999px;
+  color: #071018;
+  background: var(--gold);
+  font-size: 0.66rem;
+  font-style: normal;
+  font-weight: 900;
+}
+
+.achievement-card strong {
+  margin-top: 10px;
+  color: var(--text);
+}
+
+.achievement-card span,
+.achievement-card small {
+  display: block;
+}
+
+.achievement-card span {
+  margin-top: 7px;
+  color: #d9e5ef;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.achievement-card small {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 800;
+  line-height: 1.35;
+}
+
+.achievement-card.is-complete small {
+  color: var(--gold);
+}
+
+.achievement-progress {
+  position: absolute;
+  right: 12px;
+  bottom: 12px;
+  left: 12px;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.11);
+}
+
+.achievement-progress b {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--cyan), var(--gold));
 }
 
 .skin-card,
@@ -1405,6 +1798,33 @@ canvas {
   opacity: 0.58;
 }
 
+.unlock-progress {
+  display: grid;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.unlock-progress span {
+  color: var(--muted);
+  font-size: 0.68rem;
+  font-weight: 900;
+}
+
+.unlock-progress i {
+  position: relative;
+  height: 6px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.unlock-progress b {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--pink), var(--gold));
+}
+
 .story-card,
 .codex-card {
   background: rgba(255, 255, 255, 0.052);
@@ -1422,9 +1842,51 @@ canvas {
 }
 
 .reward-panel h2 {
-  margin: 0 0 16px;
+  margin: 0;
   color: var(--gold);
   font-size: 1.1rem;
+}
+
+.reward-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  margin-bottom: 16px;
+}
+
+.reward-reroll {
+  display: grid;
+  min-width: 172px;
+  min-height: 42px;
+  border: 1px solid rgba(255, 209, 102, 0.42);
+  border-radius: 8px;
+  padding: 8px 12px;
+  color: #071018;
+  background: var(--gold);
+  cursor: pointer;
+  text-align: left;
+}
+
+.reward-reroll strong,
+.reward-reroll span {
+  display: block;
+}
+
+.reward-reroll strong {
+  font-size: 0.78rem;
+  font-weight: 950;
+}
+
+.reward-reroll span {
+  color: rgba(7, 16, 24, 0.78);
+  font-size: 0.68rem;
+  font-weight: 850;
+}
+
+.reward-reroll:disabled {
+  cursor: default;
+  opacity: 0.45;
 }
 
 .reward-cards {
@@ -1442,6 +1904,26 @@ canvas {
   background: linear-gradient(180deg, rgba(72, 247, 255, 0.16), rgba(255, 94, 168, 0.12));
   text-align: left;
   transition: transform 120ms ease-out, border-color 120ms ease-out;
+}
+
+.reward-card-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.reward-card-top em {
+  min-width: 44px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  border-radius: 999px;
+  padding: 5px 8px;
+  color: var(--text);
+  background: rgba(8, 14, 22, 0.52);
+  font-size: 0.68rem;
+  font-style: normal;
+  font-weight: 950;
+  text-align: center;
 }
 
 .reward-card.rarity-common {
@@ -1488,6 +1970,58 @@ canvas {
   margin-top: 12px;
   color: var(--text);
   font-size: 1rem;
+}
+
+.reward-tag-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 12px;
+}
+
+.reward-tag-list i {
+  border: 1px solid rgba(72, 247, 255, 0.24);
+  border-radius: 999px;
+  padding: 5px 7px;
+  color: var(--cyan);
+  background: rgba(72, 247, 255, 0.08);
+  font-size: 0.66rem;
+  font-style: normal;
+  font-weight: 900;
+}
+
+.reward-tag-list i.is-ready {
+  border-color: rgba(255, 209, 102, 0.66);
+  color: #071018;
+  background: var(--gold);
+}
+
+.build-ready {
+  display: grid;
+  gap: 4px;
+  margin-top: 12px;
+  border: 1px solid rgba(255, 209, 102, 0.54);
+  border-radius: 8px;
+  padding: 8px;
+  background: rgba(255, 209, 102, 0.12);
+}
+
+.build-ready i,
+.build-ready span {
+  display: block;
+}
+
+.build-ready i {
+  color: var(--gold);
+  font-size: 0.68rem;
+  font-style: normal;
+  font-weight: 950;
+}
+
+.build-ready span {
+  color: var(--text);
+  font-size: 0.76rem;
+  font-weight: 850;
 }
 
 .reward-card span,
@@ -1690,6 +2224,10 @@ canvas {
   grid-column: 1 / -1;
 }
 
+.result-synergy-section {
+  grid-column: 1 / -1;
+}
+
 .result-reward-list li,
 .result-unlock-list li {
   display: flex;
@@ -1754,6 +2292,10 @@ canvas {
 .result-unlock-list i {
   color: #071018;
   background: var(--gold);
+}
+
+.result-synergy-list i {
+  background: var(--cyan);
 }
 
 .result-reward-list span {
@@ -1914,6 +2456,16 @@ canvas {
     transform: none;
   }
 
+  .tutorial-panel {
+    top: 274px;
+    right: 10px;
+    left: auto;
+    width: calc(100vw - 230px);
+    min-width: 150px;
+    padding: 10px;
+    transform: none;
+  }
+
   .boss-challenge-prompt {
     top: 184px;
     width: min(360px, calc(100vw - 20px));
@@ -1944,6 +2496,23 @@ canvas {
 
   .reward-cards {
     grid-template-columns: 1fr;
+  }
+
+  .reward-header {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .reward-reroll {
+    width: 100%;
+  }
+
+  .reward-log-panel {
+    top: 408px;
+    right: 10px;
+    left: 10px;
+    width: auto;
+    max-height: 35vh;
   }
 
   .result-panel {
@@ -1978,6 +2547,10 @@ canvas {
     grid-template-columns: 1fr;
   }
 
+  .daily-effect-list {
+    grid-template-columns: 1fr;
+  }
+
   .hub-skill-row {
     align-items: flex-start;
     flex-direction: column;
@@ -1989,7 +2562,8 @@ canvas {
   }
 
   .story-list,
-  .codex-grid {
+  .codex-grid,
+  .achievement-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -2004,6 +2578,13 @@ canvas {
   }
 
   .adventure-banner {
+    top: 408px;
+    right: 10px;
+    left: 10px;
+    width: auto;
+  }
+
+  .tutorial-panel {
     top: 408px;
     right: 10px;
     left: 10px;

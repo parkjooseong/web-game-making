@@ -1,23 +1,28 @@
 import { REWARDS, rarityLabels } from "../../game/content/rewards";
 import { ADVENTURE_STAGES } from "../../game/content/adventure";
 import { CHARACTERS, getCharacter, getSkillsForCharacter, gradeLabels, type SkillDefinition, SKILLS } from "../../game/content/skills";
+import { ACHIEVEMENTS, getAchievementProgress } from "../../game/progression/achievements";
+import { SYNERGIES, calculateActiveSynergies, countRewardTags } from "../../game/content/synergies";
 import type { SkillSlot } from "../../game/input/actions";
 import {
   CORES,
   EFFECT_PALETTES,
   NOISE_CODEX,
   STORY_ENTRIES,
+  describeDailyModifiers,
   getCoreDefinition,
   getSkinsForCharacter,
   type ProgressionStore,
   type ProgressSnapshot
 } from "../../game/progression/progression";
-import type { GameState, CastGrade, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, GameMode, BossChallengeState } from "../../game/simulation/types";
+import { getUnlockProgress, type UnlockProgress } from "../../game/progression/unlocks";
+import type { GameState, CastGrade, CastResponse, CharacterId, CharacterSkinId, CoreId, EffectPaletteId, GameMode, BossChallengeState } from "../../game/simulation/types";
 import type { PoseStatus } from "../../game/pose/PoseService";
 
 interface HudOptions {
   onEnableCamera: () => Promise<void>;
   onRewardSelected: (rewardId: string) => void;
+  onRewardReroll: () => CastResponse;
   onRestart: () => void;
   onCharacterSelected: (characterId: CharacterId) => void;
   onModeSelected: (mode: GameMode) => void;
@@ -26,6 +31,8 @@ interface HudOptions {
   onSkinSelected: (characterId: CharacterId, skinId: CharacterSkinId) => void;
   onEffectPaletteSelected: (paletteId: EffectPaletteId) => void;
   onAdventureStageSelected: (stageId: string) => void;
+  isSoundEnabled: () => boolean;
+  onSoundToggled: () => boolean;
   progression: ProgressionStore;
 }
 
@@ -50,9 +57,11 @@ export class Hud {
   private readonly enemyText: HTMLElement;
   private readonly scoreText: HTMLElement;
   private readonly comboText: HTMLElement;
+  private readonly buildText: HTMLElement;
   private readonly overdriveText: HTMLElement;
   private readonly gaugeText: HTMLElement;
   private readonly adventureBanner: HTMLElement;
+  private readonly tutorialPanel: HTMLElement;
   private readonly bossChallengePrompt: HTMLElement;
   private readonly trainingPanel: HTMLElement;
   private readonly castPrompt: HTMLElement;
@@ -67,6 +76,7 @@ export class Hud {
   private readonly modalPanel: HTMLElement;
   private readonly hubOverlay: HTMLElement;
   private readonly hubButton: HTMLButtonElement;
+  private readonly soundButton: HTMLButtonElement;
   private readonly characterSwitch: HTMLElement;
   private readonly modeSwitch: HTMLElement;
   private readonly skillEls: SkillElements;
@@ -76,6 +86,9 @@ export class Hud {
   private hubRenderKey = "";
   private rewardKey = "";
   private modalKey = "";
+  private achievementToastKey = "";
+  private rewardLogVisible = false;
+  private readonly rewardLogPanel: HTMLElement;
   private toastTimer = 0;
 
   constructor(private readonly options: HudOptions) {
@@ -108,6 +121,7 @@ export class Hud {
         <div class="bar shield"><span class="bar-fill shield-fill"></span></div>
       </div>
       <div class="combo-text"></div>
+      <div class="build-text"></div>
       <div class="overdrive-text"></div>
       <div class="character-switch"></div>
     `;
@@ -175,12 +189,14 @@ export class Hud {
     camera.appendChild(this.cameraButton);
 
     this.adventureBanner = div("adventure-banner");
+    this.tutorialPanel = div("tutorial-panel");
     this.bossChallengePrompt = div("boss-challenge-prompt");
     this.trainingPanel = div("training-panel");
     this.castPrompt = div("cast-prompt");
     this.toast = div("toast");
     this.hubOverlay = div("hub-overlay");
     this.rewardsOverlay = div("reward-overlay");
+    this.rewardLogPanel = div("reward-log-panel");
     this.modalOverlay = div("modal-overlay");
     this.modalPanel = div("modal-panel");
     this.modalOverlay.appendChild(this.modalPanel);
@@ -191,12 +207,14 @@ export class Hud {
       skillDock,
       camera,
       this.adventureBanner,
+      this.tutorialPanel,
       this.bossChallengePrompt,
       this.trainingPanel,
       this.castPrompt,
       this.toast,
       this.hubOverlay,
       this.rewardsOverlay,
+      this.rewardLogPanel,
       this.modalOverlay
     );
 
@@ -210,6 +228,7 @@ export class Hud {
     this.enemyText = topRight.querySelector(".enemy-text") as HTMLElement;
     this.scoreText = topRight.querySelector(".score-text") as HTMLElement;
     this.comboText = topLeft.querySelector(".combo-text") as HTMLElement;
+    this.buildText = topLeft.querySelector(".build-text") as HTMLElement;
     this.overdriveText = topLeft.querySelector(".overdrive-text") as HTMLElement;
     this.gaugeText = gaugeChip.querySelector(".gauge-text") as HTMLElement;
     this.cameraPanel = camera;
@@ -223,6 +242,14 @@ export class Hud {
     this.hubButton.className = "mode-button hub-button";
     this.hubButton.textContent = "허브";
     this.hubButton.addEventListener("click", () => this.toggleHub());
+    this.soundButton = document.createElement("button");
+    this.soundButton.type = "button";
+    this.soundButton.className = "mode-button sound-button";
+    this.soundButton.addEventListener("click", () => {
+      const enabled = this.options.onSoundToggled();
+      this.updateSoundButton();
+      this.showToast(enabled ? "사운드 ON" : "사운드 OFF");
+    });
     this.characterSwitch.append(
       ...Object.values(CHARACTERS).map((character) => {
         const button = document.createElement("button");
@@ -237,6 +264,7 @@ export class Hud {
     this.modeSwitch.append(
       ...[
         { mode: "story" as GameMode, label: "전투" },
+        { mode: "tutorial" as GameMode, label: "튜토리얼" },
         { mode: "adventure" as GameMode, label: "모험" },
         { mode: "survival" as GameMode, label: "생존" },
         { mode: "boss-rush" as GameMode, label: "보스" },
@@ -250,7 +278,8 @@ export class Hud {
         return button;
       })
     );
-    this.modeSwitch.appendChild(this.hubButton);
+    this.modeSwitch.append(this.soundButton, this.hubButton);
+    this.updateSoundButton();
 
     this.progressSnapshot = this.options.progression.getSnapshot();
     this.options.progression.subscribe((snapshot) => {
@@ -271,6 +300,19 @@ export class Hud {
     this.options.onHubToggled(this.hubVisible);
     this.renderHub();
     return this.hubVisible;
+  }
+
+  toggleRewardLog(force?: boolean): boolean {
+    this.rewardLogVisible = force ?? !this.rewardLogVisible;
+    this.renderRewardLog(this.latestState);
+    return this.rewardLogVisible;
+  }
+
+  updateSoundButton(): void {
+    const enabled = this.options.isSoundEnabled();
+    this.soundButton.textContent = enabled ? "사운드 ON" : "사운드 OFF";
+    this.soundButton.classList.toggle("is-muted", !enabled);
+    this.soundButton.title = enabled ? "효과음 끄기 (O)" : "효과음 켜기 (O)";
   }
 
   setCameraStatus(status: PoseStatus): void {
@@ -307,6 +349,7 @@ export class Hud {
     });
     this.root.querySelectorAll<HTMLButtonElement>(".mode-button").forEach((button) => {
       const labelByMode: Record<GameMode, string> = {
+        tutorial: "튜토리얼",
         story: "전투",
         adventure: "모험",
         survival: "생존",
@@ -318,7 +361,9 @@ export class Hud {
     this.waveText.textContent = this.getModeTitle(state);
     this.stageText.textContent = state.stageName;
     this.enemyText.textContent =
-      state.mode === "training"
+      state.mode === "tutorial"
+        ? "GUIDED RUN"
+        : state.mode === "training"
         ? `${state.enemies.length} TARGETS`
         : state.mode === "boss-rush"
           ? `${state.enemies.length + state.spawnQueue.length} BOSS`
@@ -326,7 +371,9 @@ export class Hud {
             ? `${state.enemies.length + state.spawnQueue.length} LEFT`
           : `${state.enemies.length + state.spawnQueue.length} NOISE`;
     this.scoreText.textContent =
-      state.mode === "training"
+      state.mode === "tutorial"
+        ? `STEP ${Math.min(state.tutorial.currentStepIndex + 1, state.tutorial.steps.length)}/${state.tutorial.steps.length}`
+        : state.mode === "training"
         ? "FREE CAST"
         : state.mode === "survival"
           ? `${Math.floor(Math.max(0, 600 - state.modeTime))}s LEFT`
@@ -339,6 +386,10 @@ export class Hud {
         : state.player.comboRangeBonusTime > 0
           ? "Range Boost"
           : "MoveCaster";
+    this.buildText.textContent =
+      state.activeSynergies.length > 0
+        ? `BUILD: ${state.activeSynergies.map((synergy) => synergy.title).join(" + ")}`
+        : "BUILD: 탐색 중";
     this.overdriveText.textContent =
       state.player.overdriveTime > 0
         ? `OVERDRIVE ${state.player.overdriveTime.toFixed(1)}s`
@@ -347,6 +398,7 @@ export class Hud {
           : `F: ${skills.F.name}`;
     this.gaugeText.textContent = `${Math.floor(state.player.gauge)}%`;
     this.hubButton.classList.toggle("is-active", this.hubVisible);
+    this.updateSoundButton();
 
     for (const slot of Object.keys(SKILLS) as SkillSlot[]) {
       const skill = skills[slot];
@@ -367,9 +419,12 @@ export class Hud {
     this.renderRewards(state);
     this.renderModal(state);
     this.renderAdventureBanner(state);
+    this.renderTutorialPanel(state);
     this.renderBossChallenge(state);
     this.renderTrainingPanel(state);
     this.renderHub();
+    this.renderAchievementToast(state);
+    this.renderRewardLog(state);
     this.tickToast();
   }
 
@@ -449,9 +504,24 @@ export class Hud {
     }
   }
 
+  private renderAchievementToast(state: GameState): void {
+    const key = state.runStats.unlockedAchievements.map((achievement) => achievement.id).join(",");
+    if (!key || key === this.achievementToastKey) {
+      return;
+    }
+    this.achievementToastKey = key;
+    const latest = state.runStats.unlockedAchievements[state.runStats.unlockedAchievements.length - 1];
+    if (latest) {
+      this.showToast(`업적 달성: ${latest.title}`);
+    }
+  }
+
   private getModeTitle(state: GameState): string {
     if (state.victory) {
       return "CLEAR";
+    }
+    if (state.mode === "tutorial") {
+      return "TUTORIAL";
     }
     if (state.mode === "training") {
       return "TRAINING";
@@ -494,6 +564,48 @@ export class Hud {
     `;
   }
 
+  private renderTutorialPanel(state: GameState): void {
+    if (state.mode !== "tutorial" || state.victory || state.gameOver) {
+      this.tutorialPanel.classList.remove("is-visible");
+      this.tutorialPanel.innerHTML = "";
+      return;
+    }
+
+    const tutorial = state.tutorial;
+    const step = tutorial.steps[tutorial.currentStepIndex];
+    if (!step) {
+      this.tutorialPanel.classList.remove("is-visible");
+      this.tutorialPanel.innerHTML = "";
+      return;
+    }
+
+    const progress = Math.min(100, (tutorial.steps.filter((item) => item.completed).length / tutorial.steps.length) * 100);
+    const detail =
+      step.id === "move"
+        ? `이동 유지 ${Math.min(100, Math.round((tutorial.moveSeconds / 0.8) * 100))}%`
+        : step.id === "basic-attack"
+          ? `명중 ${tutorial.basicAttackHits}/1`
+          : step.id === "prepare-q"
+            ? "Q 입력 대기"
+            : step.id === "cast-skill"
+              ? "포즈 또는 1/2/3 대기"
+              : step.id === "reward"
+                ? "카드 선택 대기"
+                : step.id === "boss-pose-break"
+                  ? "보스 카운터 대기"
+                  : "";
+
+    this.tutorialPanel.classList.add("is-visible");
+    this.tutorialPanel.innerHTML = `
+      <div class="tutorial-kicker">FIRST CAST GUIDE · ${tutorial.currentStepIndex + 1}/${tutorial.steps.length}</div>
+      <strong>${step.title}</strong>
+      <span>${step.prompt}</span>
+      <p>${step.hint}</p>
+      <small>${detail}</small>
+      <div class="tutorial-progress"><i style="width:${progress}%"></i></div>
+    `;
+  }
+
   private renderBossChallenge(state: GameState): void {
     const challenge = state.bossChallenge;
     if (!challenge || state.victory || state.gameOver) {
@@ -503,16 +615,19 @@ export class Hud {
     }
 
     const remaining = Math.max(0, challenge.expiresAt - state.time);
-    const progress = Math.max(0, Math.min(100, (remaining / 2.45) * 100));
+    const progress = Math.max(0, Math.min(100, (remaining / challenge.stepDuration) * 100));
+    const stepNow = challenge.currentIndex + 1;
+    const stepTotal = Math.max(1, challenge.sequence.length);
+    const sequenceText = challenge.sequence.map((gesture, index) => `${index === challenge.currentIndex ? ">" : ""}${gestureLabel(gesture)}`).join(" / ");
     const bossLabel =
       challenge.bossType === "drum" ? "DRUM NOISE" : challenge.bossType === "mirror" ? "MIRROR WITCH" : "ZERO MOTION";
     this.bossChallengePrompt.dataset.boss = challenge.bossType;
     this.bossChallengePrompt.classList.add("is-visible");
     this.bossChallengePrompt.innerHTML = `
-      <div class="boss-challenge-kicker">BOSS POSE BREAK</div>
+      <div class="boss-challenge-kicker">BOSS POSE BREAK · ${stepNow}/${stepTotal}</div>
       <strong>${bossLabel}</strong>
       <span>${challenge.prompt}</span>
-      <p>${gestureLabel(challenge.requiredGesture)} · 1/2/3 테스트</p>
+      <p>${sequenceText} · 1/2/3 테스트</p>
       <div class="boss-challenge-timer"><i style="width:${progress}%"></i></div>
     `;
   }
@@ -530,6 +645,27 @@ export class Hud {
     const totalCompleted = training.missions.filter((mission) => mission.completed).length;
     const perfectRate = totalAttempts > 0 ? Math.round((totalPerfects / totalAttempts) * 100) : 0;
     const last = training.lastResult;
+    const breakdown = last?.breakdown;
+    const tipIsImportant = last?.grade === "Miss" || last?.grade === "Normal";
+    const breakdownRows = breakdown
+      ? [
+          ["자세", breakdown.positionScore],
+          ["동작", breakdown.motionScore],
+          ["속도", breakdown.speedScore],
+          ["안정", breakdown.stabilityScore],
+          ["크기", breakdown.sizeScore]
+        ]
+          .map(
+            ([label, score]) => `
+              <div class="training-breakdown-row">
+                <span>${label}</span>
+                <i><b style="width:${Math.round(Number(score))}%"></b></i>
+                <strong>${Math.round(Number(score))}</strong>
+              </div>
+            `
+          )
+          .join("")
+      : "";
     const missionRows = training.missions
       .map((mission) => {
         const progress = Math.min(100, (mission.successes / mission.targetSuccesses) * 100);
@@ -566,12 +702,82 @@ export class Hud {
         <b>${last ? gestureLabel(last.gestureId) : "포즈 대기"}</b>
         <span>${last ? last.reason : "스킬 버튼을 누른 뒤 포즈를 취하거나, 1/2/3으로 다음 미션을 테스트하세요."}</span>
       </div>
+      ${
+        breakdown
+          ? `
+            <div class="training-breakdown">
+              <strong>세부 판정</strong>
+              ${breakdownRows}
+              <p class="${tipIsImportant ? "is-important" : ""}">${breakdown.tip}</p>
+            </div>
+          `
+          : ""
+      }
       <div class="training-camera-guide">
         <strong>카메라 보정 팁</strong>
         <span>상반신, 양어깨, 양손목이 모두 화면에 들어오게 1m 정도 떨어져 앉으세요. 역광을 피하고 손이 얼굴 밖으로 지나갈 만큼 공간을 확보하세요. 포즈는 스킬 준비 후 약 1.2초 안에 끝내면 가장 안정적입니다.</span>
       </div>
       <div class="training-mission-list">${missionRows}</div>
       <div class="training-unlock-note">완료 키: ${training.completedRewardKeys.length > 0 ? training.completedRewardKeys.join(" / ") : "아직 없음"}</div>
+    `;
+  }
+
+  private renderRewardLog(state: GameState | null): void {
+    if (!state || !this.rewardLogVisible) {
+      this.rewardLogPanel.classList.remove("is-visible");
+      this.rewardLogPanel.innerHTML = "";
+      return;
+    }
+
+    const grouped = new Map<string, number>();
+    for (const rewardId of state.runStats.rewardsChosen) {
+      grouped.set(rewardId, (grouped.get(rewardId) ?? 0) + 1);
+    }
+    const rewardRows = Array.from(grouped.entries())
+      .map(([rewardId, count]) => {
+        const reward = REWARDS.find((item) => item.id === rewardId);
+        if (!reward) {
+          return "";
+        }
+        return `
+          <li class="rarity-${reward.rarity}">
+            <i>${rarityLabels[reward.rarity]}</i>
+            <div>
+              <strong>${reward.title} <b>${count}/${reward.maxStacks}</b></strong>
+              <span>${reward.tags.join(" / ")}</span>
+            </div>
+          </li>
+        `;
+      })
+      .join("");
+    const synergyRows =
+      state.activeSynergies.length > 0
+        ? state.activeSynergies
+            .map(
+              (synergy) => `
+                <li>
+                  <i>BUILD</i>
+                  <div>
+                    <strong>${synergy.title}</strong>
+                    <span>${synergy.activeEffect}</span>
+                  </div>
+                </li>
+              `
+            )
+            .join("")
+        : `<li class="empty-reward-log"><div><strong>완성된 빌드 없음</strong><span>같은 태그 보상을 모아보세요.</span></div></li>`;
+
+    this.rewardLogPanel.classList.add("is-visible");
+    this.rewardLogPanel.innerHTML = `
+      <div class="reward-log-header">
+        <strong>선택한 보상</strong>
+        <span>Tab</span>
+      </div>
+      <ul>${rewardRows || `<li class="empty-reward-log"><div><strong>선택한 카드 없음</strong><span>웨이브 보상을 고르면 여기에 기록됩니다.</span></div></li>`}</ul>
+      <div class="reward-log-header is-sub">
+        <strong>현재 빌드</strong>
+      </div>
+      <ul>${synergyRows}</ul>
     `;
   }
 
@@ -589,6 +795,21 @@ export class Hud {
         return `${skill.id}:${progress?.uses ?? 0}:${progress?.perfects ?? 0}:${progress?.level ?? 1}`;
       })
       .join("|");
+    const unlockProgressKey = [
+      this.progressSnapshot.unlockedCoreIds.join(","),
+      this.progressSnapshot.unlockedEffectPaletteIds.join(","),
+      ACHIEVEMENTS.map((achievement) => {
+        const progress = this.progressSnapshot.achievements[achievement.id];
+        return `${achievement.id}:${progress?.current ?? 0}:${progress?.completed ? 1 : 0}`;
+      }).join("|"),
+      Object.values(this.progressSnapshot.characters)
+        .map((progress) => `${progress.level}:${progress.perfectCasts}:${progress.runs}:${progress.victories}`)
+        .join("|"),
+      Object.values(this.progressSnapshot.skills)
+        .map((progress) => `${progress.uses}:${progress.perfects}:${progress.level}`)
+        .join("|"),
+      `${this.progressSnapshot.unlockStats.storyVictories}:${this.progressSnapshot.unlockStats.maruBossClears}:${this.progressSnapshot.unlockStats.lowHpVictories}`
+    ].join("::");
     const renderKey = [
       state.characterId,
       this.progressSnapshot.equippedCoreId,
@@ -597,11 +818,13 @@ export class Hud {
       this.progressSnapshot.unlockedSkinIds.join(","),
       this.progressSnapshot.discoveredEnemyTypes.join(","),
       this.progressSnapshot.selectedAdventureStageId,
+      this.progressSnapshot.tutorialCompleted ? "tutorial-done" : "tutorial-new",
       ADVENTURE_STAGES.map((stage) => {
         const progress = this.progressSnapshot.adventureStages[stage.id];
         return `${stage.id}:${progress?.clears ?? 0}:${progress?.bestGrade ?? "-"}:${progress?.bestScore ?? 0}`;
       }).join("|"),
       this.progressSnapshot.daily.dateKey,
+      unlockProgressKey,
       characterProgress.xp,
       characterProgress.level,
       skillKey
@@ -639,11 +862,14 @@ export class Hud {
       .join("");
     const coreButtons = CORES.map((core) => {
       const equipped = core.id === this.progressSnapshot.equippedCoreId;
+      const unlocked = this.progressSnapshot.unlockedCoreIds.includes(core.id);
+      const unlock = getUnlockProgress(this.progressSnapshot, "core", core.id);
       return `
-        <button class="core-card ${equipped ? "is-equipped" : ""}" data-core-id="${core.id}">
+        <button class="core-card ${equipped ? "is-equipped" : ""} ${unlocked ? "" : "is-locked"}" data-core-id="${core.id}">
           <strong>${core.title}</strong>
           <span>${core.description}</span>
-          <small>${equipped ? "장착 중" : "장착"}</small>
+          <small>${equipped ? "장착 중" : unlocked ? "장착" : `잠김 · ${unlock?.condition ?? "해금 조건 미달성"}`}</small>
+          ${unlocked ? "" : renderUnlockProgress(unlock)}
         </button>
       `;
     }).join("");
@@ -675,12 +901,14 @@ export class Hud {
       .map((skin) => {
         const unlocked = this.progressSnapshot.unlockedSkinIds.includes(skin.id);
         const equipped = skin.id === selectedSkinId;
+        const unlock = getUnlockProgress(this.progressSnapshot, "skin", skin.id);
         return `
-          <button class="skin-card ${equipped ? "is-equipped" : ""}" data-skin-id="${skin.id}" style="--skin-color:${skin.themeColor}" ${unlocked ? "" : "disabled"}>
+          <button class="skin-card ${equipped ? "is-equipped" : ""} ${unlocked ? "" : "is-locked"}" data-skin-id="${skin.id}" style="--skin-color:${skin.themeColor}" ${unlocked ? "" : "disabled"}>
             <i>${skin.shortLabel}</i>
             <strong>${skin.title}</strong>
             <span>${skin.description}</span>
-            <small>${equipped ? "장착 중" : unlocked ? "장착" : "잠김"}</small>
+            <small>${equipped ? "장착 중" : unlocked ? "장착" : `잠김 · ${unlock?.condition ?? "해금 조건 미달성"}`}</small>
+            ${unlocked ? "" : renderUnlockProgress(unlock)}
           </button>
         `;
       })
@@ -688,12 +916,14 @@ export class Hud {
     const effectCards = EFFECT_PALETTES.map((palette) => {
       const equipped = palette.id === this.progressSnapshot.equippedEffectPaletteId;
       const unlocked = this.progressSnapshot.unlockedEffectPaletteIds.includes(palette.id);
+      const unlock = getUnlockProgress(this.progressSnapshot, "effect", palette.id);
       return `
-        <button class="effect-card ${equipped ? "is-equipped" : ""}" data-effect-id="${palette.id}" style="--effect-color:${palette.uiColor}" ${unlocked ? "" : "disabled"}>
+        <button class="effect-card ${equipped ? "is-equipped" : ""} ${unlocked ? "" : "is-locked"}" data-effect-id="${palette.id}" style="--effect-color:${palette.uiColor}" ${unlocked ? "" : "disabled"}>
           <i>${palette.shortLabel}</i>
           <strong>${palette.title}</strong>
           <span>${palette.description}</span>
-          <small>${equipped ? "적용 중" : unlocked ? "적용" : "잠김"}</small>
+          <small>${equipped ? "적용 중" : unlocked ? "적용" : `잠김 · ${unlock?.condition ?? "해금 조건 미달성"}`}</small>
+          ${unlocked ? "" : renderUnlockProgress(unlock)}
         </button>
       `;
     }).join("");
@@ -718,6 +948,23 @@ export class Hud {
         </div>
       `;
     }).join("");
+    const achievementCards = ACHIEVEMENTS.map((achievement) => {
+      const stored = this.progressSnapshot.achievements[achievement.id];
+      const progress = getAchievementProgress(this.progressSnapshot, achievement);
+      const completed = Boolean(stored?.completed || progress.completed);
+      return `
+        <div class="achievement-card ${completed ? "is-complete" : ""}">
+          <i>${achievement.category}</i>
+          <strong>${achievement.title}</strong>
+          <span>${achievement.description}</span>
+          <small>${completed ? "달성 완료" : progress.label}${achievement.rewardDescription ? ` · ${achievement.rewardDescription}` : ""}</small>
+          <div class="achievement-progress"><b style="width:${progress.percent}%"></b></div>
+        </div>
+      `;
+    }).join("");
+    const dailyEffectRows = describeDailyModifiers(this.progressSnapshot.daily.modifiers)
+      .map((effect) => `<li>${effect}</li>`)
+      .join("");
 
     this.hubOverlay.innerHTML = `
       <div class="hub-panel">
@@ -735,18 +982,21 @@ export class Hud {
             <div class="hub-xp"><i style="width:${Math.min(100, characterProgress.xp % 100)}%"></i></div>
             <small>Perfect Cast ${characterProgress.perfectCasts}회 · 장착 코어 ${equippedCore.title}</small>
           </section>
-          <section class="hub-section">
+          <section class="hub-section daily-section">
             <strong>오늘의 데일리 챌린지</strong>
             <span>${this.progressSnapshot.daily.title}</span>
             <small>${this.progressSnapshot.daily.description}</small>
+            <ul class="daily-effect-list">${dailyEffectRows}</ul>
           </section>
           <section class="hub-section hub-facilities">
             <strong>시설</strong>
             <span>모션 연구소 · 캐릭터 라운지 · 코어 공방 · 훈련장 · 노이즈 도감 · 스타일 룸</span>
             <div class="hub-action-row">
+              <button class="hub-tutorial" type="button">튜토리얼</button>
               <button class="hub-training" type="button">훈련장</button>
               <button class="hub-adventure" type="button">모험 시작</button>
             </div>
+            <small>${this.progressSnapshot.tutorialCompleted ? "튜토리얼 완료됨 · 언제든 다시 연습할 수 있습니다." : "처음 플레이는 튜토리얼부터 추천합니다."}</small>
           </section>
           <section class="hub-section hub-wide adventure-map-section">
             <strong>모험 지도</strong>
@@ -765,6 +1015,11 @@ export class Hud {
             <strong>캐릭터 라운지</strong>
             <span>플레이할수록 캐릭터 에피소드와 대사가 열립니다.</span>
             <div class="story-list">${storyCards}</div>
+          </section>
+          <section class="hub-section hub-wide">
+            <strong>업적</strong>
+            <span>장기 목표를 달성하면 결과 화면에 기록되고, 일부 업적은 스킨과 이펙트 해금 조건이 됩니다.</span>
+            <div class="achievement-grid">${achievementCards}</div>
           </section>
           <section class="hub-section hub-wide">
             <strong>노이즈 도감</strong>
@@ -788,6 +1043,10 @@ export class Hud {
     `;
 
     this.hubOverlay.querySelector<HTMLButtonElement>(".hub-close")?.addEventListener("click", () => this.toggleHub(false));
+    this.hubOverlay.querySelector<HTMLButtonElement>(".hub-tutorial")?.addEventListener("click", () => {
+      this.options.onModeSelected("tutorial");
+      this.toggleHub(false);
+    });
     this.hubOverlay.querySelector<HTMLButtonElement>(".hub-training")?.addEventListener("click", () => {
       this.options.onModeSelected("training");
       this.toggleHub(false);
@@ -809,6 +1068,11 @@ export class Hud {
       button.addEventListener("click", () => {
         const coreId = button.dataset.coreId as CoreId | undefined;
         if (coreId) {
+          if (!this.progressSnapshot.unlockedCoreIds.includes(coreId)) {
+            const unlock = getUnlockProgress(this.progressSnapshot, "core", coreId);
+            this.showToast(`잠김: ${unlock?.condition ?? "해금 조건 미달성"}${unlock ? ` (${unlock.label})` : ""}`);
+            return;
+          }
           this.options.onCoreSelected(coreId);
           this.options.onHubToggled(true);
           this.hubRenderKey = "";
@@ -841,7 +1105,15 @@ export class Hud {
   }
 
   private renderRewards(state: GameState): void {
-    const key = state.pendingRewardIds.join("|");
+    const key = [
+      state.pendingRewardIds.join("|"),
+      state.rewardOfferHistoryIds.join("|"),
+      state.rewardRerollsRemaining,
+      Math.floor(state.player.score),
+      Math.floor(state.player.gauge),
+      state.runStats.rewardsChosen.join("|"),
+      state.pendingRewardIds.map((rewardId) => `${rewardId}:${state.rewardStacks[rewardId] ?? 0}`).join("|")
+    ].join("::");
     if (key === this.rewardKey) {
       this.rewardsOverlay.classList.toggle("is-visible", state.pendingRewardIds.length > 0);
       return;
@@ -855,9 +1127,30 @@ export class Hud {
     }
 
     const panel = div("reward-panel");
+    const header = div("reward-header");
     const title = document.createElement("h2");
     title.textContent = state.mode === "adventure" ? `${state.adventureStageCode} Stage Clear` : "Motion Core Reward";
-    panel.appendChild(title);
+    const isFreeReroll = state.rewardRerollsRemaining >= 2;
+    const canPayReroll = state.player.score >= 500 || state.player.gauge >= 20;
+    const canReroll = state.rewardRerollsRemaining > 0 && (isFreeReroll || canPayReroll);
+    const rerollButton = document.createElement("button");
+    rerollButton.type = "button";
+    rerollButton.className = "reward-reroll";
+    rerollButton.disabled = !canReroll;
+    rerollButton.innerHTML = `
+      <strong>리롤</strong>
+      <span>${state.rewardRerollsRemaining}회 남음 · ${isFreeReroll ? "무료" : "500점 또는 게이지 20"}</span>
+    `;
+    rerollButton.addEventListener("click", () => {
+      const response = this.options.onRewardReroll();
+      this.showToast(response.line);
+      this.rewardKey = "";
+      if (this.latestState) {
+        this.renderRewards(this.latestState);
+      }
+    });
+    header.append(title, rerollButton);
+    panel.appendChild(header);
 
     const cards = div("reward-cards");
     for (const rewardId of state.pendingRewardIds) {
@@ -865,14 +1158,25 @@ export class Hud {
       if (!reward) {
         continue;
       }
+      const stack = state.rewardStacks[reward.id] ?? 0;
+      const buildReady = getBuildReadyTitles(state, reward.id);
       const button = document.createElement("button");
       button.type = "button";
       button.className = `reward-card rarity-${reward.rarity}`;
       button.innerHTML = `
-        <i class="reward-rarity">${rarityLabels[reward.rarity]}</i>
+        <div class="reward-card-top">
+          <i class="reward-rarity">${rarityLabels[reward.rarity]}</i>
+          <em>${stack}/${reward.maxStacks}</em>
+        </div>
         <strong>${reward.title}</strong>
         <span>${reward.description}</span>
-        <small>${reward.characterId ? `${getCharacter(reward.characterId).name} 전용` : "공용"} · ${reward.tags.join(" / ")}</small>
+        <div class="reward-tag-list">${renderRewardTagChips(state, reward.id)}</div>
+        ${
+          buildReady.length > 0
+            ? `<div class="build-ready"><i>BUILD READY</i><span>${buildReady.join(" / ")}</span></div>`
+            : ""
+        }
+        <small>${reward.characterId ? `${getCharacter(reward.characterId).name} 전용` : "공용"} · 현재 스택 ${stack}/${reward.maxStacks}</small>
       `;
       button.addEventListener("click", () => this.options.onRewardSelected(reward.id));
       cards.appendChild(button);
@@ -907,7 +1211,11 @@ export class Hud {
       stats.damageTaken,
       stats.skillsUsed,
       stats.xpGained,
+      stats.dailyChallengeTitle,
+      stats.dailyChallengeCleared,
       stats.unlockedItems.map((item) => item.id).join(","),
+      stats.unlockedAchievements.map((achievement) => achievement.id).join(","),
+      state.activeSynergies.map((synergy) => synergy.id).join(","),
       stats.rewardsChosen.join(",")
     ].join(":");
     if (key === this.modalKey) {
@@ -947,6 +1255,39 @@ export class Hud {
               )
               .join("")
           : `<li class="empty-unlock"><div><strong>새 해금 없음</strong><span>다음 판에서 조건을 노려보세요.</span></div></li>`;
+      const achievementItems =
+        stats.unlockedAchievements.length > 0
+          ? stats.unlockedAchievements
+              .map(
+                (achievement) => `
+                  <li>
+                    <i>ACHV</i>
+                    <div>
+                      <strong>${achievement.title}</strong>
+                      <span>${achievement.rewardDescription ? `${achievement.description} · ${achievement.rewardDescription}` : achievement.description}</span>
+                    </div>
+                  </li>
+                `
+              )
+              .join("")
+          : `<li class="empty-unlock"><div><strong>새 업적 없음</strong><span>허브의 업적 목록에서 다음 목표를 확인하세요.</span></div></li>`;
+      const synergyItems =
+        state.activeSynergies.length > 0
+          ? state.activeSynergies
+              .map(
+                (synergy) => `
+                  <li>
+                    <i>BUILD</i>
+                    <div>
+                      <strong>${synergy.title}</strong>
+                      <span>${synergy.activeEffect}</span>
+                    </div>
+                  </li>
+                `
+              )
+              .join("")
+          : `<li class="empty-unlock"><div><strong>완성한 빌드 없음</strong><span>태그가 같은 보상 카드를 모으면 빌드가 완성됩니다.</span></div></li>`;
+      const dailyResultLabel = stats.dailyChallengeCleared ? "클리어" : state.victory || state.gameOver ? "미완료" : "진행 중";
 
       this.modalPanel.innerHTML = `
         <div class="result-header">
@@ -961,6 +1302,7 @@ export class Hud {
           ${resultStat("획득 XP", `+${stats.xpGained.toLocaleString()}`)}
           ${resultStat("레벨", levelText)}
           ${resultStat("받은 피해", stats.damageTaken.toLocaleString())}
+          ${resultStat("데일리", `${dailyResultLabel} · ${stats.dailyChallengeTitle}`)}
         </div>
         <div class="result-body-grid">
           <section class="result-section">
@@ -983,6 +1325,14 @@ export class Hud {
           <section class="result-section">
             <strong>Chosen Rewards</strong>
             <ul class="result-reward-list">${rewardItems}</ul>
+          </section>
+          <section class="result-section result-synergy-section">
+            <strong>Completed Builds</strong>
+            <ul class="result-unlock-list result-synergy-list">${synergyItems}</ul>
+          </section>
+          <section class="result-section result-achievement-section">
+            <strong>Achievements</strong>
+            <ul class="result-unlock-list result-achievement-list">${achievementItems}</ul>
           </section>
           <section class="result-section result-unlock-section">
             <strong>New Unlocks</strong>
@@ -1027,6 +1377,52 @@ function div(className: string): HTMLElement {
   return element;
 }
 
+function getBuildReadyTitles(state: GameState, rewardId: string): string[] {
+  const currentIds = new Set(state.activeSynergies.map((synergy) => synergy.id));
+  return calculateActiveSynergies(state.characterId, [...state.runStats.rewardsChosen, rewardId])
+    .filter((synergy) => !currentIds.has(synergy.id))
+    .map((synergy) => synergy.title);
+}
+
+function renderRewardTagChips(state: GameState, rewardId: string): string {
+  const reward = REWARDS.find((item) => item.id === rewardId);
+  if (!reward) {
+    return "";
+  }
+
+  const currentCounts = countRewardTags(state.runStats.rewardsChosen);
+  return reward.tags
+    .map((tag) => {
+      const synergy = SYNERGIES.find((item) => (item.characterId === null || item.characterId === state.characterId) && item.tag === tag);
+      const nextCount = (currentCounts[tag] ?? 0) + 1;
+      const progress = synergy ? `${Math.min(nextCount, synergy.requiredCount)}/${synergy.requiredCount}` : `+${nextCount}`;
+      const ready = synergy && nextCount >= synergy.requiredCount && !state.activeSynergies.some((item) => item.id === synergy.id);
+      return `<i class="${ready ? "is-ready" : ""}">${tagLabel(tag)} ${progress}</i>`;
+    })
+    .join("");
+}
+
+function tagLabel(tag: string): string {
+  const labels: Record<string, string> = {
+    attack: "공격",
+    skill: "스킬",
+    cooldown: "쿨감",
+    gauge: "게이지",
+    survival: "생존",
+    dash: "대시",
+    perfect: "Perfect",
+    basic: "기본",
+    area: "광역",
+    boss: "보스",
+    shield: "실드",
+    summon: "소환",
+    mark: "표식",
+    trap: "함정",
+    ultimate: "궁극"
+  };
+  return labels[tag] ?? tag;
+}
+
 function resultStat(label: string, value: string): string {
   return `
     <div class="result-stat">
@@ -1045,6 +1441,24 @@ function resultGrade(label: CastGrade, value: number): string {
   `;
 }
 
+function renderUnlockProgress(progress: UnlockProgress | null): string {
+  if (!progress) {
+    return `
+      <div class="unlock-progress">
+        <span>조건 정보 없음</span>
+        <i><b style="width:0%"></b></i>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="unlock-progress">
+      <span>${progress.label}</span>
+      <i><b style="width:${progress.percent}%"></b></i>
+    </div>
+  `;
+}
+
 function formatDuration(seconds: number): string {
   const total = Math.max(0, Math.floor(seconds));
   const minutesText = Math.floor(total / 60)
@@ -1056,6 +1470,7 @@ function formatDuration(seconds: number): string {
 
 function modeLabel(mode: GameMode): string {
   const labels: Record<GameMode, string> = {
+    tutorial: "튜토리얼",
     story: "전투",
     adventure: "모험",
     survival: "생존",

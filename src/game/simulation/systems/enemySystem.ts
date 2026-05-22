@@ -15,26 +15,43 @@ export function makeSurvivalWave(wave: number): EnemyType[] {
       : wave < 6
         ? ["runner", "swarm", "swarm", "shooter", "tank", "castBreaker", "bombNoise"]
         : wave < 9
-          ? ["runner", "swarm", "shooter", "tank", "castBreaker", "shieldNoise", "anchorNoise", "bombNoise"]
-          : ["runner", "swarm", "shooter", "tank", "castBreaker", "shieldNoise", "anchorNoise", "medicNoise", "bombNoise", "mirror"];
+          ? ["runner", "swarm", "shooter", "tank", "castBreaker", "shieldNoise", "anchorNoise", "bombNoise", "balloonClown"]
+          : [
+              "runner",
+              "swarm",
+              "shooter",
+              "tank",
+              "castBreaker",
+              "shieldNoise",
+              "anchorNoise",
+              "medicNoise",
+              "bombNoise",
+              "balloonClown",
+              "crystalReflector",
+              "mirror"
+            ];
   const enemies: EnemyType[] = [];
   for (let index = 0; index < count; index += 1) {
     enemies.push(pool[Math.floor(Math.random() * pool.length)]);
   }
   if (wave > 0 && wave % 4 === 0) {
-    enemies.push(wave >= 8 ? "mirror" : "drum");
+    enemies.push(wave >= 12 ? "crystalReflector" : wave >= 8 ? "mirror" : wave >= 6 ? "balloonClown" : "drum");
   }
   return enemies;
 }
 
 export function isBossEnemy(type: EnemyType): type is BossChallengeState["bossType"] {
-  return type === "drum" || type === "mirror" || type === "zero";
+  return type === "balloonClown" || type === "crystalReflector" || type === "drum" || type === "mirror" || type === "zero";
 }
 
 export function contactDamageForEnemy(type: EnemyType): number {
   switch (type) {
     case "zero":
       return 13;
+    case "balloonClown":
+      return 11;
+    case "crystalReflector":
+      return 10;
     case "mirror":
       return 9;
     case "tank":
@@ -70,6 +87,10 @@ export function enemyStats(type: EnemyType, waveScale: number): EnemyStats {
       return { radius: 25, hp: 58 * waveScale, speedMin: 76, speedMax: 98 };
     case "bombNoise":
       return { radius: 23, hp: 32 * waveScale, speedMin: 92, speedMax: 122 };
+    case "balloonClown":
+      return { radius: 62, hp: 520 * waveScale, speedMin: 58, speedMax: 76 };
+    case "crystalReflector":
+      return { radius: 56, hp: 560 * waveScale, speedMin: 48, speedMax: 66 };
     case "shooter":
       return { radius: 24, hp: 46 * waveScale, speedMin: 62, speedMax: 82 };
     case "tank":
@@ -104,6 +125,10 @@ export function scoreForEnemy(type: EnemyType): number {
       return 180;
     case "bombNoise":
       return 115;
+    case "balloonClown":
+      return 1650;
+    case "crystalReflector":
+      return 1750;
     case "tank":
       return 210;
     case "drum":
@@ -136,6 +161,10 @@ export function gaugeForEnemy(type: EnemyType): number {
       return 15;
     case "bombNoise":
       return 9;
+    case "balloonClown":
+      return 38;
+    case "crystalReflector":
+      return 40;
     case "tank":
       return 16;
     case "drum":

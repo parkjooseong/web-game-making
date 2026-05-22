@@ -48,6 +48,15 @@ export const ADVENTURE_STAGES: AdventureStageDefinition[] = [
     startMessage: "AREA 2-1"
   },
   {
+    id: "2-clown",
+    code: "2-B",
+    region: "놀이공원",
+    title: "풍선 광대의 퍼레이드",
+    goal: "풍선 분열과 파티 폭탄을 포즈 브레이크로 꺾으세요",
+    enemies: ["swarm", "bombNoise", "anchorNoise", "runner", "balloonClown"],
+    startMessage: "MID BOSS 2"
+  },
+  {
     id: "2-2",
     code: "2-2",
     region: "미러 타워",
@@ -55,6 +64,15 @@ export const ADVENTURE_STAGES: AdventureStageDefinition[] = [
     goal: "거울 분신과 원거리 압박을 끊어내세요",
     enemies: ["runner", "shooter", "shieldNoise", "tank", "mirror", "swarm", "swarm"],
     startMessage: "AREA 2-2"
+  },
+  {
+    id: "2-crystal",
+    code: "2-C",
+    region: "미러 타워",
+    title: "크리스탈 리플렉터",
+    goal: "정면 반사를 피해 본체를 드러내고 거울 레이저를 끊으세요",
+    enemies: ["shieldNoise", "runner", "swarm", "castBreaker", "crystalReflector"],
+    startMessage: "MID BOSS 2"
   },
   {
     id: "2-3",

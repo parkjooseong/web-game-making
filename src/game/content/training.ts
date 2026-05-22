@@ -13,32 +13,32 @@ export const TRAINING_MISSIONS: TrainingMissionDefinition[] = [
   {
     id: "slash-basics",
     gestureId: "slash",
-    title: "Slash Path",
-    prompt: "손목이 어깨선 밖으로 확실히 지나가도록 빠르게 휘두르세요.",
+    title: "슬래시 경로",
+    prompt: "손목이 어깨 밖을 지나가게 크게 휘둘러요.",
     targetSuccesses: 5,
     rewardKey: "training.slash.basic"
   },
   {
     id: "guard-cross",
     gestureId: "cross-guard",
-    title: "Guard Cross",
-    prompt: "양 손목이 몸 중앙에서 교차되도록 팔을 X자로 모으세요.",
+    title: "크로스 가드",
+    prompt: "양손목을 몸 중앙에서 X자로 모아요.",
     targetSuccesses: 5,
     rewardKey: "training.guard.basic"
   },
   {
     id: "circle-control",
     gestureId: "circle",
-    title: "Circle Control",
-    prompt: "손목 궤적이 작아지지 않게 부드럽게 원을 그리세요.",
+    title: "서클 컨트롤",
+    prompt: "손목으로 큰 원을 부드럽게 그려요.",
     targetSuccesses: 5,
     rewardKey: "training.circle.basic"
   },
   {
     id: "open-arms-release",
     gestureId: "open-arms",
-    title: "Open Arms",
-    prompt: "양 손목을 어깨보다 넓게 벌리고 상체가 화면에 남도록 유지하세요.",
+    title: "오픈 암",
+    prompt: "양손을 어깨보다 넓게 벌려요.",
     targetSuccesses: 5,
     rewardKey: "training.open-arms.basic"
   }

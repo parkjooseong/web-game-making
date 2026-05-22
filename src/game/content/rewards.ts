@@ -40,7 +40,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "perfect-tempo",
     title: "완벽한 자세",
-    description: "Perfect Cast 시 현재 스킬 쿨타임을 35% 돌려받습니다.",
+    description: "퍼펙트 캐스트 시 현재 스킬 쿨타임 35%를 돌려받습니다.",
     rarity: "rare",
     characterId: null,
     tags: ["perfect", "cooldown"],
@@ -58,7 +58,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "noise-absorb",
     title: "노이즈 흡수",
-    description: "적 처치 시 스킬 게이지 획득량 +45%.",
+    description: "적 처치 시 코어 게이지 획득량 +45%.",
     rarity: "uncommon",
     characterId: null,
     tags: ["gauge"],
@@ -85,7 +85,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "combo-battery",
     title: "콤보 배터리",
-    description: "Perfect 2연속 보너스 게이지가 더 많이 차오릅니다.",
+    description: "퍼펙트 2연속 보너스 게이지가 더 많이 차오릅니다.",
     rarity: "rare",
     characterId: null,
     tags: ["perfect", "gauge"],
@@ -103,7 +103,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "core-pocket",
     title: "예비 코어 포켓",
-    description: "최대 스킬 게이지 +20, 즉시 20 충전합니다.",
+    description: "최대 코어 게이지 +20, 즉시 20 충전합니다.",
     rarity: "uncommon",
     characterId: null,
     tags: ["gauge"],
@@ -139,7 +139,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "safe-failure",
     title: "안전 보정",
-    description: "Miss 때 잃는 쿨타임이 35% 감소합니다.",
+    description: "미스 때 잃는 쿨타임이 35% 감소합니다.",
     rarity: "common",
     characterId: null,
     tags: ["cooldown", "survival"],
@@ -202,7 +202,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "perfect-discipline",
     title: "완벽한 호흡",
-    description: "Perfect Cast 성공 시 게이지를 추가로 8 회복합니다.",
+    description: "퍼펙트 캐스트 성공 시 게이지를 추가로 8 회복합니다.",
     rarity: "rare",
     characterId: null,
     tags: ["perfect", "gauge"],
@@ -238,7 +238,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "forked-slash",
     title: "번개 잔상",
-    description: "스파크 슬래시 피해량 +20%, Perfect 시 검기가 한 번 더 터집니다.",
+    description: "스파크 슬래시 피해량 +20%, 퍼펙트 시 검기가 한 번 더 터집니다.",
     rarity: "uncommon",
     characterId: "rio",
     tags: ["skill", "attack", "area"],
@@ -319,7 +319,7 @@ export const REWARDS: RewardDefinition[] = [
   {
     id: "air-splitting-slash",
     title: "공기 가르기",
-    description: "스파크 슬래시 피해 +14%, Perfect 추가 폭발 피해가 증가합니다.",
+    description: "스파크 슬래시 피해 +14%, 퍼펙트 추가 폭발 피해가 증가합니다.",
     rarity: "rare",
     characterId: "rio",
     tags: ["skill", "attack"],

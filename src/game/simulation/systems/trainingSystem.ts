@@ -7,8 +7,8 @@ export function castTrainingDebugGrade(state: GameState, fxEvents: FxEvent[], gr
     score: grade === "Perfect" ? 96 : grade === "Great" ? 82 : 58,
     grade,
     confidence: 1,
-    reason: "debug input",
-    breakdown: debugBreakdown(grade, "디버그 입력입니다. 실제 카메라에서는 각 세부 점수가 표시됩니다.")
+    reason: "1/2/3 대체 입력",
+    breakdown: debugBreakdown(grade, "카메라로 플레이하면 세부 점수가 표시돼요.")
   };
   recordTrainingGestureResult(state, fxEvents, result);
   state.runStats.skillsUsed += 1;
@@ -19,7 +19,7 @@ export function castTrainingDebugGrade(state: GameState, fxEvents: FxEvent[], gr
   } else {
     state.player.comboPerfect = 0;
   }
-  state.message = `훈련 ${gestureId} ${grade}`;
+  state.message = `훈련 ${gestureLabel(gestureId)} ${gradeLabel(grade)}`;
   fxEvents.push({
     kind: "float-text",
     x: state.player.x,
@@ -70,7 +70,7 @@ export function recordTrainingGestureResult(state: GameState, fxEvents: FxEvent[
       kind: "float-text",
       x: state.player.x,
       y: state.player.y - 126,
-      text: `${mission.title} COMPLETE`,
+      text: `${mission.title} 완료`,
       color: 0xffd166
     });
     fxEvents.push({ kind: "sound", sound: "unlock" });
@@ -100,4 +100,36 @@ function castGradeSound(grade: CastGrade) {
     return "cast-normal";
   }
   return "hit";
+}
+
+function gradeLabel(grade: CastGrade): string {
+  if (grade === "Perfect") {
+    return "퍼펙트";
+  }
+  if (grade === "Great") {
+    return "그레이트";
+  }
+  if (grade === "Normal") {
+    return "노멀";
+  }
+  return "미스";
+}
+
+function gestureLabel(gestureId: GestureId): string {
+  const labels: Record<GestureId, string> = {
+    slash: "슬래시",
+    thrust: "스러스트",
+    rise: "라이즈",
+    "open-arms": "오픈 암",
+    "cross-guard": "크로스 가드",
+    "palm-push": "팜 푸시",
+    "ground-slam": "그라운드 슬램",
+    point: "포인트",
+    circle: "서클",
+    wave: "웨이브",
+    spread: "스프레드",
+    heart: "하트",
+    "focus-triangle": "포커스 트라이앵글"
+  };
+  return labels[gestureId];
 }

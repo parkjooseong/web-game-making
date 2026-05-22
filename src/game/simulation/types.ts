@@ -1,7 +1,10 @@
 import type { SkillSlot } from "../input/actions";
+import type { CharacterQuestUnlock } from "../progression/characterQuests";
 
 export type CharacterId = "rio" | "maru" | "neon" | "cookie";
-export type GameMode = "tutorial" | "story" | "adventure" | "survival" | "boss-rush" | "training";
+export type GameMode = "title" | "quick-demo" | "tutorial" | "story" | "adventure" | "survival" | "boss-rush" | "training";
+export type Difficulty = "easy" | "normal" | "hard" | "pose-master";
+export type PoseAssistLevel = "relaxed" | "normal" | "strict";
 export type CoreId = "echo-core" | "rhythm-core" | "guard-core" | "rampage-core" | "stability-core" | "focus-core";
 export type CharacterSkinId =
   | "rio-default"
@@ -54,11 +57,13 @@ export type EnemyType =
   | "anchorNoise"
   | "medicNoise"
   | "bombNoise"
+  | "balloonClown"
+  | "crystalReflector"
   | "drum"
   | "mirror"
   | "zero"
   | "dummy";
-export type BossType = "drum" | "mirror" | "zero";
+export type BossType = "balloonClown" | "crystalReflector" | "drum" | "mirror" | "zero";
 export type ProjectileOwner = "player" | "enemy";
 export type SoundId =
   | "prepare"
@@ -92,6 +97,7 @@ export type SoundId =
 export type UnlockItemType = "core" | "skin" | "effect";
 export type StageRegion = "루프시티" | "놀이공원" | "미러 타워" | "제로 존" | "훈련장" | "보스 러시";
 export type StageHazardKind = "rotator" | "mirror-reversal" | "stasis-drain";
+export type SynergyTier = "basic" | "advanced" | "signature" | "mythic";
 
 export interface UnlockedItem {
   type: UnlockItemType;
@@ -156,6 +162,9 @@ export interface PlayerState extends Vector2 {
   score: number;
   lastSkillId: string | null;
   sameSkillChain: number;
+  lastCastSkillId: string | null;
+  lastCastGrade: Exclude<CastGrade, "Miss"> | null;
+  castAnimTime: number;
 }
 
 export interface EnemyState extends Vector2 {
@@ -241,7 +250,15 @@ export interface BossChallengeState {
   stepPrompts: string[];
   expiresAt: number;
   stepDuration: number;
-  successEffect: "drum-counter" | "drum-combo-counter" | "mirror-shatter" | "mirror-prison-break" | "zero-release" | "zero-final-release";
+  successEffect:
+    | "balloon-deflate"
+    | "crystal-reveal"
+    | "drum-counter"
+    | "drum-combo-counter"
+    | "mirror-shatter"
+    | "mirror-prison-break"
+    | "zero-release"
+    | "zero-final-release";
   failDamage: number;
 }
 
@@ -250,6 +267,7 @@ export interface ActiveSynergyState {
   title: string;
   description: string;
   activeEffect: string;
+  tier: SynergyTier;
 }
 
 export interface RunStats {
@@ -264,6 +282,7 @@ export interface RunStats {
   rewardsChosen: string[];
   unlockedItems: UnlockedItem[];
   unlockedAchievements: AchievementUnlock[];
+  characterQuestUnlocks: CharacterQuestUnlock[];
   xpGained: number;
   levelBefore: number;
   levelAfter: number;
@@ -273,7 +292,14 @@ export interface RunStats {
   shieldDamageAbsorbed: number;
   markedEnemyKills: number;
   slimesSummoned: number;
+  maxSlimesMaintained: number;
   bossesDefeated: BossType[];
+}
+
+export interface DevDebugStats {
+  dpsEstimate: number;
+  bossChallengeSuccesses: number;
+  bossChallengeFailures: number;
 }
 
 export interface TrainingMissionState {
@@ -331,6 +357,13 @@ export interface TutorialState {
   rewardChosen: boolean;
   bossChallengeCleared: boolean;
   completed: boolean;
+}
+
+export interface QuickDemoState {
+  phaseIndex: number;
+  rewardOffered: boolean;
+  bossSpawned: boolean;
+  bossChallengeStarted: boolean;
 }
 
 export interface PlayerUpgrades {
@@ -409,11 +442,17 @@ export interface PlayerUpgrades {
 export interface GameState {
   time: number;
   mode: GameMode;
+  difficulty: Difficulty;
+  poseAssistLevel: PoseAssistLevel;
   characterId: CharacterId;
   paused: boolean;
   gameOver: boolean;
   victory: boolean;
   stageName: string;
+  objectiveText: string;
+  objectiveDetail: string;
+  objectiveProgress: number;
+  objectiveIsUrgent: boolean;
   stageRegion: StageRegion;
   adventureStageIndex: number;
   adventureStageTotal: number;
@@ -446,8 +485,10 @@ export interface GameState {
   cooldowns: Record<SkillSlot, number>;
   player: PlayerState;
   runStats: RunStats;
+  debugStats: DevDebugStats;
   training: TrainingState;
   tutorial: TutorialState;
+  quickDemo: QuickDemoState;
   activeSynergies: ActiveSynergyState[];
   stageHazards: StageHazardState[];
   enemies: EnemyState[];

@@ -1,4 +1,5 @@
 import { ADVENTURE_STAGES } from "../content/adventure";
+import { getAppliedDifficultyModifiers } from "../content/difficulty";
 import { CHARACTER_ORDER, getCharacter, getSkillsForCharacter } from "../content/skills";
 import { calculateActiveSynergies } from "../content/synergies";
 import { createTrainingState } from "../content/training";
@@ -6,6 +7,8 @@ import { createTutorialState } from "../content/tutorial";
 import type { MoveInput, SkillSlot } from "../input/actions";
 import { CORES, DEFAULT_DAILY_MODIFIERS, getDefaultSkinId, type DailyChallengeModifiers } from "../progression/progression";
 import type { ProgressionStore } from "../progression/progression";
+import type { CharacterQuestUnlock } from "../progression/characterQuests";
+import type { RunHistoryMetadata, RunHistoryStore } from "../progression/runHistory";
 import { BossSystem, getCurrentBossChallengeGesture, type BossChallengeConfig } from "./systems/bossSystem";
 import type { DamageEnemyOptions } from "./systems/combatTypes";
 import { contactDamageForEnemy, enemyStats, gaugeForEnemy, isBossEnemy, makeSurvivalWave, scoreForEnemy } from "./systems/enemySystem";
@@ -46,19 +49,69 @@ const wavePlans: EnemyType[][] = [
   ["runner", "swarm", "shooter", "shieldNoise", "anchorNoise", "medicNoise", "bombNoise", "drum"]
 ];
 
-const bossRushPlan: EnemyType[] = ["drum", "mirror", "zero"];
+const bossRushPlan: EnemyType[] = ["drum", "balloonClown", "crystalReflector", "mirror", "zero"];
+const QUICK_DEMO_DURATION = 180;
+
+interface QuickDemoPhasePlan {
+  startsAt: number;
+  title: string;
+  message: string;
+  region: StageRegion;
+  enemies: EnemyType[];
+}
+
+const quickDemoPhases: QuickDemoPhasePlan[] = [
+  {
+    startsAt: 0,
+    title: "3분 데모: 첫 움직임",
+    message: "Q를 누르고 슬래시로 노이즈를 정리해요.",
+    region: "루프시티",
+    enemies: ["runner", "runner", "swarm", "runner", "swarm"]
+  },
+  {
+    startsAt: 30,
+    title: "3분 데모: 보상 빌드",
+    message: "카드 1장을 고르고 웨이브를 돌파해요.",
+    region: "루프시티",
+    enemies: ["runner", "runner", "swarm", "shooter", "shooter", "tank", "runner"]
+  },
+  {
+    startsAt: 80,
+    title: "3분 데모: AR 캐스팅",
+    message: "새 노이즈 등장! AR 가이드를 보고 크게 움직여요.",
+    region: "미러 타워",
+    enemies: ["castBreaker", "shieldNoise", "runner", "anchorNoise", "bombNoise", "medicNoise", "swarm", "shooter"]
+  },
+  {
+    startsAt: 140,
+    title: "3분 데모: 드럼 노이즈",
+    message: "드럼 노이즈의 보스 포즈 브레이크를 막아요!",
+    region: "루프시티",
+    enemies: []
+  }
+];
+
+interface DebugDamageSample {
+  at: number;
+  amount: number;
+}
 
 export class GameSimulation {
   private state: GameState;
   private nextEntityId = 1;
   private fxEvents: FxEvent[] = [];
   private selectedCharacterId: CharacterId = "rio";
-  private selectedMode: GameMode = "story";
+  private selectedMode: GameMode = "title";
   private runReported = false;
+  private debugDamageSamples: DebugDamageSample[] = [];
   private dailyModifiers: DailyChallengeModifiers = { ...DEFAULT_DAILY_MODIFIERS };
   private readonly bossSystem: BossSystem;
+  private runTelemetryProvider: (() => RunHistoryMetadata) | null = null;
 
-  constructor(private readonly progression?: ProgressionStore) {
+  constructor(
+    private readonly progression?: ProgressionStore,
+    private readonly runHistory?: RunHistoryStore
+  ) {
     this.bossSystem = new BossSystem({
       getState: () => this.state,
       pushFx: (event) => this.fxEvents.push(event),
@@ -70,11 +123,9 @@ export class GameSimulation {
       completeTutorialStep: (stepId) => this.completeTutorialStep(stepId),
       startTutorialBossPoseBreak: () => this.startTutorialBossPoseBreak()
     });
-    if (progression && !progression.getSnapshot().tutorialCompleted) {
-      this.selectedMode = "tutorial";
-    }
     this.state = this.createInitialState();
     this.startMode();
+    this.updateObjectiveState();
   }
 
   getState(): GameState {
@@ -83,6 +134,10 @@ export class GameSimulation {
 
   getCurrentSkills() {
     return getSkillsForCharacter(this.state.characterId);
+  }
+
+  setRunTelemetryProvider(provider: () => RunHistoryMetadata): void {
+    this.runTelemetryProvider = provider;
   }
 
   drainFxEvents(): FxEvent[] {
@@ -95,8 +150,10 @@ export class GameSimulation {
     this.nextEntityId = 1;
     this.fxEvents = [];
     this.runReported = false;
+    this.debugDamageSamples = [];
     this.state = this.createInitialState();
     this.startMode();
+    this.updateObjectiveState();
   }
 
   switchCharacter(characterId?: CharacterId): void {
@@ -124,13 +181,15 @@ export class GameSimulation {
   update(dt: number, input: SimulationInput): void {
     const state = this.state;
     const step = clamp(dt, 0, 1 / 30);
+    this.updateObjectiveState();
 
-    if (state.paused || state.gameOver || state.victory || state.pendingRewardIds.length > 0) {
+    if (state.mode === "title" || state.paused || state.gameOver || state.victory || state.pendingRewardIds.length > 0) {
       return;
     }
 
     state.time += step;
     state.modeTime += step;
+    this.updateDebugStats();
     this.updateTimers(step);
     this.updatePreparedSkillExpiry();
     this.updateBossChallengeExpiry();
@@ -139,6 +198,7 @@ export class GameSimulation {
     this.updateSynergyEffects(step);
     this.updateSpawning(step);
     this.updateSurvivalFlow();
+    this.updateQuickDemoFlow();
     this.updateEnemies(step);
     this.updateTraps(step);
     this.updateAllies(step);
@@ -146,35 +206,39 @@ export class GameSimulation {
     this.updateBasicAttack(step);
     this.updateTutorial(step, input);
     this.checkWaveComplete();
+    this.updateObjectiveState();
   }
 
   prepareSkill(slot: SkillSlot): CastResponse {
     const state = this.state;
     const skill = this.getCurrentSkills()[slot];
 
+    if (state.mode === "title") {
+      return { ok: false, line: "먼저 게임을 시작해요." };
+    }
     if (state.paused || state.gameOver || state.victory || state.pendingRewardIds.length > 0) {
-      return { ok: false, line: "지금은 시전할 수 없습니다." };
+      return { ok: false, line: "지금은 포즈 캐스트를 쓸 수 없어요." };
     }
     if (state.preparedSkill) {
-      return { ok: false, line: "이미 포즈를 읽는 중입니다." };
+      return { ok: false, line: "이미 포즈를 읽고 있어요." };
     }
     if (state.bossChallenge) {
-      return { ok: false, line: "보스 포즈 브레이크가 우선입니다." };
+      return { ok: false, line: "먼저 보스 포즈를 막아야 해요!" };
     }
     if (state.mode === "tutorial") {
       const stepId = this.getCurrentTutorialStep()?.id;
       if (stepId !== "prepare-q" && stepId !== "cast-skill") {
-        return { ok: false, line: "튜토리얼 목표를 먼저 완료하세요." };
+        return { ok: false, line: "먼저 튜토리얼 목표를 끝내요." };
       }
       if (slot !== "Q") {
-        return { ok: false, line: "이번 단계에서는 Q 스킬만 사용합니다." };
+        return { ok: false, line: "이번엔 Q 스킬만 써요." };
       }
     }
     if (state.cooldowns[slot] > 0) {
       return { ok: false, line: `${skill.name} 쿨타임 ${state.cooldowns[slot].toFixed(1)}초` };
     }
     if (state.player.gauge < skill.gaugeCost) {
-      return { ok: false, line: "스킬 게이지가 부족합니다." };
+      return { ok: false, line: "코어 게이지가 부족해요." };
     }
 
     state.preparedSkill = {
@@ -195,7 +259,7 @@ export class GameSimulation {
     const state = this.state;
     const prepared = state.preparedSkill;
     if (!prepared) {
-      return { ok: false, line: "준비된 스킬이 없습니다." };
+      return { ok: false, line: "먼저 스킬을 준비해요." };
     }
 
     const skill = this.getCurrentSkills()[prepared.slot];
@@ -216,7 +280,7 @@ export class GameSimulation {
       state.cooldowns[prepared.slot] = skill.cooldown * (state.activeCoreId === "stability-core" ? 0.16 : 0.3) * state.upgrades.missCooldownMultiplier;
       state.player.comboPerfect = 0;
       state.player.sameSkillChain = 0;
-      this.addUnlockedAchievements(this.progression?.recordCast(state.characterId, skill.id, result.grade) ?? []);
+      this.addCastProgressResult(this.progression?.recordCast(state.characterId, skill.id, result.grade));
       state.message = getCharacter(state.characterId).failureLine;
       this.fxEvents.push({
         kind: "float-text",
@@ -233,6 +297,9 @@ export class GameSimulation {
     state.player.gauge = clamp(state.player.gauge - skill.gaugeCost, 0, state.player.maxGauge);
     state.player.sameSkillChain = state.player.lastSkillId === skill.id ? Math.min(5, state.player.sameSkillChain + 1) : 1;
     state.player.lastSkillId = skill.id;
+    state.player.lastCastSkillId = skill.id;
+    state.player.lastCastGrade = result.grade;
+    state.player.castAnimTime = skill.slot === "F" ? 1.25 : 0.82;
 
     if (result.grade === "Perfect") {
       state.player.comboPerfect += 1;
@@ -243,11 +310,21 @@ export class GameSimulation {
           kind: "float-text",
           x: state.player.x,
           y: state.player.y - 124,
-          text: "BUILD SCORE",
+          text: "빌드 점수",
           color: 0xffd166
         });
       }
+      if (this.hasSynergy("perfectionist")) {
+        state.player.score += Math.round((180 + state.player.comboPerfect * 32) * state.upgrades.scoreMultiplier);
+        state.player.gauge = clamp(state.player.gauge + 5, 0, state.player.maxGauge);
+      }
       state.cooldowns[prepared.slot] *= 1 - state.upgrades.perfectCooldownRefund;
+      if (this.hasSynergy("fast-hands-route")) {
+        for (const slot of Object.keys(state.cooldowns) as SkillSlot[]) {
+          state.cooldowns[slot] = Math.max(0, state.cooldowns[slot] - 0.45);
+        }
+        state.cooldowns[prepared.slot] *= 0.92;
+      }
       if (state.activeCoreId === "rhythm-core") {
         state.player.gauge = clamp(state.player.gauge + 10, 0, state.player.maxGauge);
         state.upgrades.basicAttackRateMultiplier = Math.max(state.upgrades.basicAttackRateMultiplier, 1.18);
@@ -265,8 +342,9 @@ export class GameSimulation {
     }
 
     const dailySkillDamageMultiplier = this.getDailySkillCastDamageMultiplier(skill.gestureId, result.grade);
+    const difficultySkillDamageMultiplier = result.grade === "Perfect" ? this.getDifficultyModifiers().perfectDamageMultiplier : 1;
     const originalSkillDamageMultiplier = state.upgrades.skillDamageMultiplier;
-    state.upgrades.skillDamageMultiplier *= dailySkillDamageMultiplier;
+    state.upgrades.skillDamageMultiplier *= dailySkillDamageMultiplier * difficultySkillDamageMultiplier;
     this.resolveSkillEffect(skill.id, result.grade);
     state.upgrades.skillDamageMultiplier = originalSkillDamageMultiplier;
     this.applyPostSkillSynergy(skill.color);
@@ -285,7 +363,7 @@ export class GameSimulation {
     if (state.activeCoreId === "guard-core" && isGuardSkill(skill.id)) {
       state.player.shield = Math.max(state.player.shield, result.grade === "Perfect" ? 30 : 18);
     }
-    this.addUnlockedAchievements(this.progression?.recordCast(state.characterId, skill.id, result.grade) ?? []);
+    this.addCastProgressResult(this.progression?.recordCast(state.characterId, skill.id, result.grade));
 
     const line =
       skill.slot === "F"
@@ -297,7 +375,7 @@ export class GameSimulation {
           : `${skill.name} ${result.grade}`;
     state.message = line;
     if (skill.slot === "F" && (result.grade === "Great" || result.grade === "Perfect")) {
-      this.pushCutIn(skill.name.toUpperCase(), result.grade === "Perfect" ? getCharacter(state.characterId).ultimateLine : "궁극기 포즈 캐스팅", skill.color, 640);
+      this.pushCutIn(skill.name.toUpperCase(), result.grade === "Perfect" ? getCharacter(state.characterId).ultimateLine : "궁극기 포즈 캐스트", skill.color, 640);
     }
     this.fxEvents.push({
       kind: "float-text",
@@ -320,7 +398,7 @@ export class GameSimulation {
         grade,
         confidence: 1,
         reason: "debug input",
-        breakdown: debugBreakdown(grade, "디버그 입력으로 포즈 성공을 시뮬레이션했습니다.")
+        breakdown: debugBreakdown(grade, "1/2/3 대체 입력으로 포즈를 테스트했어요.")
       });
     }
 
@@ -329,7 +407,7 @@ export class GameSimulation {
       if (this.state.mode === "training") {
         return this.castTrainingDebugGrade(grade);
       }
-      return { ok: false, line: "준비된 스킬이 없습니다." };
+      return { ok: false, line: "먼저 스킬을 준비해요." };
     }
 
     return this.castPreparedSkill({
@@ -338,14 +416,14 @@ export class GameSimulation {
       grade,
       confidence: 1,
       reason: "debug input",
-      breakdown: debugBreakdown(grade, "디버그 입력으로 포즈 성공을 시뮬레이션했습니다.")
+      breakdown: debugBreakdown(grade, "1/2/3 대체 입력으로 포즈를 테스트했어요.")
     });
   }
 
   castBossChallenge(result: GestureResult): CastResponse {
     const challenge = this.state.bossChallenge;
     if (!challenge) {
-      return { ok: false, line: "진행 중인 보스 포즈 브레이크가 없습니다." };
+      return { ok: false, line: "진행 중인 보스 포즈가 없어요." };
     }
 
     const requiredGesture = getCurrentBossChallengeGesture(challenge);
@@ -407,19 +485,65 @@ export class GameSimulation {
     this.continueAfterReward();
   }
 
+  debugFillGauge(): CastResponse {
+    const player = this.state.player;
+    player.gauge = player.maxGauge;
+    this.state.message = "DEV: 게이지 100";
+    this.fxEvents.push({ kind: "float-text", x: player.x, y: player.y - 116, text: "GAUGE 100", color: 0x48f7ff });
+    return { ok: true, line: "코어 게이지 100!" };
+  }
+
+  debugClearWave(): CastResponse {
+    const state = this.state;
+    if (state.mode === "training") {
+      return { ok: false, line: "훈련장에서는 웨이브 클리어를 쓰지 않아요." };
+    }
+    state.spawnQueue = [];
+    state.enemies = state.enemies.filter((enemy) => enemy.type === "dummy");
+    state.projectiles = state.projectiles.filter((projectile) => projectile.owner === "player");
+    state.bossChallenge = null;
+    state.message = "DEV: 현재 웨이브 클리어";
+    this.fxEvents.push({ kind: "float-text", x: state.player.x, y: state.player.y - 126, text: "WAVE CLEAR", color: 0xffd166 });
+    return { ok: true, line: "현재 웨이브를 비웠어요." };
+  }
+
+  debugSpawnBoss(): CastResponse {
+    const state = this.state;
+    if (state.enemies.some((enemy) => isBossEnemy(enemy.type))) {
+      return { ok: false, line: "이미 보스가 있어요." };
+    }
+    const bossType = this.getDebugBossType();
+    this.spawnEnemy(bossType);
+    state.waveActive = true;
+    state.message = `DEV: ${bossType} 소환`;
+    this.fxEvents.push({ kind: "sound", sound: "boss" });
+    this.fxEvents.push({ kind: "float-text", x: state.player.x, y: state.player.y - 132, text: "BOSS SPAWN", color: 0xff5ea8 });
+    return { ok: true, line: `${bossType} 보스 소환!` };
+  }
+
+  debugForceReward(): CastResponse {
+    const state = this.state;
+    if (state.pendingRewardIds.length > 0) {
+      return { ok: false, line: "이미 보상 카드가 열려요." };
+    }
+    this.openRewardChoice(3);
+    state.message = "DEV: 보상 카드 강제 표시";
+    return { ok: true, line: "보상 카드 3장 오픈!" };
+  }
+
   rerollRewards(): CastResponse {
     const state = this.state;
     if (state.pendingRewardIds.length === 0) {
-      return { ok: false, line: "리롤할 보상 카드가 없습니다." };
+      return { ok: false, line: "리롤할 카드가 없어요." };
     }
     if (state.rewardRerollsRemaining <= 0) {
-      return { ok: false, line: "이번 런의 리롤 횟수를 모두 사용했습니다." };
+      return { ok: false, line: "이번 런 리롤을 모두 썼어요." };
     }
 
     const isFree = state.rewardRerollsRemaining >= 2;
     const nextRewards = this.rollRewards(state.pendingRewardIds.length, state.rewardOfferHistoryIds);
     if (nextRewards.length === 0) {
-      return { ok: false, line: "새로 제안할 카드가 없습니다." };
+      return { ok: false, line: "새 카드가 없어요." };
     }
 
     if (!isFree) {
@@ -451,6 +575,8 @@ export class GameSimulation {
     const character = getCharacter(this.selectedCharacterId);
     const progress = this.progression?.getSnapshot();
     const daily = this.progression?.getDailyChallenge();
+    const difficulty = progress?.selectedDifficulty ?? "normal";
+    const poseAssistLevel = progress?.selectedPoseAssistLevel ?? "normal";
     this.dailyModifiers = { ...DEFAULT_DAILY_MODIFIERS, ...(daily?.modifiers ?? {}) };
     const activeCoreId = this.dailyModifiers.randomCore
       ? CORES[Math.floor(Math.random() * CORES.length)]?.id ?? "stability-core"
@@ -462,11 +588,17 @@ export class GameSimulation {
     const state: GameState = {
       time: 0,
       mode: this.selectedMode,
+      difficulty,
+      poseAssistLevel,
       characterId: this.selectedCharacterId,
       paused: false,
       gameOver: false,
       victory: false,
       stageName: "루프시티 거리",
+      objectiveText: "시작할 모드를 고르세요.",
+      objectiveDetail: "튜토리얼, 훈련장, 모험을 선택할 수 있어요.",
+      objectiveProgress: 0,
+      objectiveIsUrgent: false,
       stageRegion: "루프시티",
       adventureStageIndex: 0,
       adventureStageTotal: ADVENTURE_STAGES.length,
@@ -524,7 +656,10 @@ export class GameSimulation {
         infiniteGaugeTime: 0,
         score: 0,
         lastSkillId: null,
-        sameSkillChain: 0
+        sameSkillChain: 0,
+        lastCastSkillId: null,
+        lastCastGrade: null,
+        castAnimTime: 0
       },
       runStats: {
         kills: 0,
@@ -538,6 +673,7 @@ export class GameSimulation {
         rewardsChosen: [],
         unlockedItems: [],
         unlockedAchievements: [],
+        characterQuestUnlocks: [],
         xpGained: 0,
         levelBefore: characterLevel,
         levelAfter: characterLevel,
@@ -547,10 +683,22 @@ export class GameSimulation {
         shieldDamageAbsorbed: 0,
         markedEnemyKills: 0,
         slimesSummoned: 0,
+        maxSlimesMaintained: 0,
         bossesDefeated: []
+      },
+      debugStats: {
+        dpsEstimate: 0,
+        bossChallengeSuccesses: 0,
+        bossChallengeFailures: 0
       },
       training: createTrainingState(),
       tutorial: createTutorialState(),
+      quickDemo: {
+        phaseIndex: -1,
+        rewardOffered: false,
+        bossSpawned: false,
+        bossChallengeStarted: false
+      },
       activeSynergies: [],
       stageHazards: [],
       enemies: [],
@@ -639,6 +787,7 @@ export class GameSimulation {
       state.upgrades.basicAttackRateMultiplier += 0.08;
     }
     this.applyDailyInitialModifiers(state);
+    this.applyDifficultyInitialModifiers(state);
 
     return state;
   }
@@ -651,6 +800,12 @@ export class GameSimulation {
     state.upgrades.scoreMultiplier *= modifiers.enemyScoreMultiplier;
     state.upgrades.dashSkillDamageMultiplier += modifiers.dashSkillDamageBonus;
     state.upgrades.areaMultiplier *= modifiers.areaDamageMultiplier;
+  }
+
+  private applyDifficultyInitialModifiers(state: GameState): void {
+    const modifiers = this.getDifficultyModifiers(state);
+    state.upgrades.scoreMultiplier *= modifiers.scoreMultiplier;
+    state.upgrades.missCooldownMultiplier *= modifiers.missCooldownMultiplier;
   }
 
   private updateTimers(dt: number): void {
@@ -666,6 +821,7 @@ export class GameSimulation {
     state.player.hurtCooldown = Math.max(0, state.player.hurtCooldown - dt);
     state.player.comboRangeBonusTime = Math.max(0, state.player.comboRangeBonusTime - dt);
     state.player.overdriveTime = Math.max(0, state.player.overdriveTime - dt);
+    state.player.castAnimTime = Math.max(0, state.player.castAnimTime - dt);
     state.player.shieldWallTime = Math.max(0, state.player.shieldWallTime - dt);
     state.player.controlReverseTime = Math.max(0, state.player.controlReverseTime - dt);
     state.player.movementSlowTime = Math.max(0, state.player.movementSlowTime - dt);
@@ -695,8 +851,8 @@ export class GameSimulation {
         score: 0,
         grade: "Miss",
         confidence: 0,
-        reason: "포즈 시간이 지났습니다.",
-        breakdown: debugBreakdown("Miss", "제한 시간 안에 동작을 끝내보세요.")
+        reason: "포즈 시간이 지났어요.",
+        breakdown: debugBreakdown("Miss", "스킬 준비 후 바로 움직여요.")
       });
     }
   }
@@ -837,7 +993,7 @@ export class GameSimulation {
             kind: "float-text",
             x: player.x,
             y: player.y - 80,
-            text: "CORE DRAIN",
+            text: "코어 드레인",
             color: 0x8c7aff
           });
         }
@@ -860,6 +1016,32 @@ export class GameSimulation {
           enemy.slowTime = Math.max(enemy.slowTime, 0.12);
         }
       }
+    }
+
+    const pulseTick = Math.floor(state.time * 2) !== Math.floor((state.time - dt) * 2);
+    if (pulseTick && this.hasSynergy("maru-absolute-line") && state.player.shield >= 72) {
+      for (const enemy of state.enemies) {
+        if (enemy.type === "dummy" || distance(state.player, enemy) > state.player.radius + enemy.radius + 245) {
+          continue;
+        }
+        const away = normalize({ x: enemy.x - state.player.x, y: enemy.y - state.player.y });
+        enemy.x = clamp(enemy.x + away.x * 42, 28, WORLD_WIDTH - 28);
+        enemy.y = clamp(enemy.y + away.y * 42, 28, WORLD_HEIGHT - 28);
+        enemy.slowTime = Math.max(enemy.slowTime, 0.35);
+        this.damageEnemy(enemy, 6, 0xffd166, { bypassFrontGuard: true });
+      }
+      this.fxEvents.push({ kind: "burst", x: state.player.x, y: state.player.y, radius: 245, color: 0xffd166, grade: "Great" });
+    }
+
+    if (pulseTick && this.hasSynergy("cookie-jelly-kingdom") && state.allies.length >= 6) {
+      state.player.shield = Math.max(state.player.shield, Math.min(64, state.player.shield + 3));
+      this.fxEvents.push({
+        kind: "float-text",
+        x: state.player.x,
+        y: state.player.y - 104,
+        text: "JELLY KINGDOM",
+        color: 0x7dffb2
+      });
     }
   }
 
@@ -916,6 +1098,47 @@ export class GameSimulation {
     }
   }
 
+  private updateQuickDemoFlow(): void {
+    const state = this.state;
+    if (state.mode !== "quick-demo" || state.pendingRewardIds.length > 0 || state.gameOver || state.victory) {
+      return;
+    }
+
+    let nextPhaseIndex = 0;
+    for (let index = 0; index < quickDemoPhases.length; index += 1) {
+      if (state.modeTime >= quickDemoPhases[index].startsAt) {
+        nextPhaseIndex = index;
+      }
+    }
+    if (nextPhaseIndex !== state.quickDemo.phaseIndex) {
+      this.startQuickDemoPhase(nextPhaseIndex);
+    }
+
+    const activeBoss = state.enemies.find((enemy) => enemy.type === "drum");
+    if (state.quickDemo.phaseIndex >= 3 && activeBoss && !state.quickDemo.bossChallengeStarted && state.modeTime >= 143 && !state.bossChallenge) {
+      state.quickDemo.bossChallengeStarted = this.startBossChallenge(activeBoss, {
+        bossType: "drum",
+        requiredGesture: "cross-guard",
+        prompt: "양팔을 X자로 모아 드럼 피날레를 막아요! 카메라가 없으면 1/2/3.",
+        successEffect: "drum-counter",
+        failDamage: 12,
+        duration: 3.05
+      });
+      if (state.quickDemo.bossChallengeStarted) {
+        activeBoss.pulseCooldown = Math.max(activeBoss.pulseCooldown, 5.2);
+      }
+    }
+
+    if (state.quickDemo.bossSpawned && !activeBoss && state.spawnQueue.length === 0) {
+      this.completeQuickDemo(true, "데모 완료");
+      return;
+    }
+
+    if (state.modeTime >= QUICK_DEMO_DURATION) {
+      this.completeQuickDemo(!activeBoss, activeBoss ? "데모 종료: 드럼 노이즈 생존" : "데모 완료");
+    }
+  }
+
   private updateEnemies(dt: number): void {
     const state = this.state;
     const player = state.player;
@@ -943,7 +1166,7 @@ export class GameSimulation {
         enemy.y += dir.y * enemy.speed * speedScale * desired * dt;
         if (state.preparedSkill && dist < enemy.radius + player.radius + 14) {
           state.preparedSkill = null;
-          state.message = "캐스트 브레이커가 포즈를 끊었습니다.";
+          state.message = "캐스트 브레이커가 포즈를 끊었어요.";
           this.damagePlayer(5);
           enemy.slowTime = Math.max(enemy.slowTime, 0.7);
           enemy.pulseCooldown = 1.5;
@@ -1014,6 +1237,40 @@ export class GameSimulation {
       } else if (enemy.type === "tank") {
         enemy.x += dir.x * enemy.speed * speedScale * dt;
         enemy.y += dir.y * enemy.speed * speedScale * dt;
+      } else if (enemy.type === "balloonClown") {
+        const side = { x: -dir.y, y: dir.x };
+        const desired = dist < 360 ? -0.28 : dist > 640 ? 0.58 : 0.08;
+        const wobble = Math.sin(state.time * 2.4 + enemy.id) * 0.34;
+        enemy.x += (dir.x * desired + side.x * wobble) * enemy.speed * speedScale * dt;
+        enemy.y += (dir.y * desired + side.y * wobble) * enemy.speed * speedScale * dt;
+        if (enemy.shootCooldown <= 0) {
+          this.spawnPartyBombCircles(enemy, enemy.phase >= 3 ? 6 : enemy.phase >= 2 ? 4 : 3);
+          enemy.shootCooldown = randomRange(enemy.phase >= 3 ? 2.3 : 3.1, enemy.phase >= 3 ? 3.1 : 4.2);
+        }
+        if (enemy.pulseCooldown <= 0) {
+          this.performBalloonJump(enemy);
+          this.startBalloonChallenge(enemy);
+          enemy.pulseCooldown = randomRange(enemy.phase >= 3 ? 5.3 : 6.4, enemy.phase >= 3 ? 6.5 : 7.8);
+        }
+      } else if (enemy.type === "crystalReflector") {
+        const side = { x: -dir.y, y: dir.x };
+        const desired = dist < 420 ? -0.52 : dist > 720 ? 0.42 : 0.04;
+        enemy.x += (dir.x * desired + side.x * 0.32) * enemy.speed * speedScale * dt;
+        enemy.y += (dir.y * desired + side.y * 0.32) * enemy.speed * speedScale * dt;
+        if (enemy.shootCooldown <= 0 && dist < 920) {
+          this.fireCrystalLaser(enemy, dir);
+          enemy.shootCooldown = randomRange(enemy.phase >= 3 ? 1.55 : 2.05, enemy.phase >= 3 ? 2.1 : 2.85);
+        }
+        if (enemy.pulseCooldown <= 0) {
+          if (enemy.phase >= 2) {
+            this.swapCrystalWithClone(enemy);
+          }
+          const challenged = this.startCrystalChallenge(enemy);
+          if (!challenged && enemy.phase < 2) {
+            this.spawnMirrorClone(enemy);
+          }
+          enemy.pulseCooldown = randomRange(enemy.phase >= 3 ? 5.5 : 6.6, enemy.phase >= 3 ? 6.6 : 8.2);
+        }
       } else if (enemy.type === "drum") {
         const desired = dist < 520 ? -0.28 : dist > 720 ? 0.42 : 0;
         enemy.x += dir.x * enemy.speed * speedScale * desired * dt;
@@ -1030,7 +1287,7 @@ export class GameSimulation {
             this.startBossChallenge(enemy, {
               bossType: "drum",
               requiredGesture: "cross-guard",
-              prompt: "팔을 X자로 교차해 리듬 반사를 카운터하세요",
+              prompt: "양팔을 X자로 모아 리듬을 반사해요!",
               successEffect: "drum-counter",
               failDamage: 18,
               duration: 2.25
@@ -1087,7 +1344,7 @@ export class GameSimulation {
               : this.startBossChallenge(enemy, {
                   bossType: "zero",
                   requiredGesture: "open-arms",
-                  prompt: "양팔을 크게 벌려 제로 모션의 정지장을 깨세요",
+                  prompt: "양팔을 크게 벌려 정지장을 깨요!",
                   successEffect: "zero-release",
                   failDamage: 22,
                   duration: 2.45
@@ -1102,7 +1359,7 @@ export class GameSimulation {
       enemy.x = clamp(enemy.x, 28, WORLD_WIDTH - 28);
       enemy.y = clamp(enemy.y, 28, WORLD_HEIGHT - 28);
 
-      if (enemy.type !== "drum" && dist < enemy.radius + player.radius && player.hurtCooldown <= 0) {
+      if (!isBossEnemy(enemy.type) && dist < enemy.radius + player.radius && player.hurtCooldown <= 0) {
         this.damagePlayer(contactDamageForEnemy(enemy.type));
         player.x = clamp(player.x + dir.x * -38, 48, WORLD_WIDTH - 48);
         player.y = clamp(player.y + dir.y * -38, 48, WORLD_HEIGHT - 48);
@@ -1147,7 +1404,18 @@ export class GameSimulation {
         for (const enemy of [...state.enemies]) {
           if (distance(trap, enemy) < trap.radius + enemy.radius) {
             enemy.slowTime = Math.max(enemy.slowTime, trap.kind === "sweet-field" ? 1.25 : 0.7);
-            const markBonus = enemy.markedTime > 0 ? 1.45 : 1;
+            let markBonus = enemy.markedTime > 0 ? 1.45 : 1;
+            if (this.hasSynergy("neon-hacking-field") && enemy.markedTime > 0) {
+              markBonus *= 1.22;
+              const spillTarget = state.enemies
+                .filter((item) => item.id !== enemy.id && item.type !== "dummy")
+                .map((item) => ({ enemy: item, dist: distance(enemy, item) }))
+                .filter((item) => item.dist < 210)
+                .sort((a, b) => a.dist - b.dist)[0]?.enemy;
+              if (spillTarget) {
+                spillTarget.markedTime = Math.max(spillTarget.markedTime, 3.5);
+              }
+            }
             this.damageEnemy(enemy, trap.damage * markBonus, trap.color, { source: trap, bypassFrontGuard: true });
           }
         }
@@ -1175,7 +1443,9 @@ export class GameSimulation {
   private updateAllies(dt: number): void {
     const state = this.state;
     const remaining: AllyState[] = [];
-    const allyTempo = this.hasSynergy("cookie-slime-party-chef") && state.allies.length >= 5 ? 1.35 : 1;
+    const slimePartyChef = this.hasSynergy("cookie-slime-party-chef") && state.allies.length >= 5;
+    const jellyKingdom = this.hasSynergy("cookie-jelly-kingdom") && state.allies.length >= 6;
+    const allyTempo = jellyKingdom ? 1.52 : slimePartyChef ? 1.35 : 1;
 
     for (const ally of state.allies) {
       ally.ttl -= dt;
@@ -1192,7 +1462,7 @@ export class GameSimulation {
 
         if (distance(ally, target) < ally.radius + target.radius + 12 && ally.attackCooldown <= 0) {
           target.slowTime = Math.max(target.slowTime, ally.kind === "big-slime" ? 1.1 : 0.55);
-          this.damageEnemy(target, ally.damage, ally.color, { source: ally });
+          this.damageEnemy(target, ally.damage * (jellyKingdom ? 1.18 : 1), ally.color, { source: ally, sourceAllyKind: ally.kind });
           ally.attackCooldown = ally.kind === "big-slime" ? 0.42 : 0.62;
           this.fxEvents.push({
             kind: "burst",
@@ -1265,7 +1535,8 @@ export class GameSimulation {
       return;
     }
 
-    const attackInterval = 0.48 / state.upgrades.basicAttackRateMultiplier;
+    const basicExpert = this.hasSynergy("basic-attack-expert");
+    const attackInterval = 0.48 / state.upgrades.basicAttackRateMultiplier / (basicExpert ? 1.14 : 1);
     player.attackTimer = attackInterval;
 
     const target = this.findNearestEnemy(player, 620);
@@ -1281,14 +1552,29 @@ export class GameSimulation {
       y: player.y + direction.y * 28,
       direction,
       speed: 660 * state.upgrades.basicProjectileSpeedMultiplier,
-      damage: character.basicDamage * state.upgrades.basicDamageMultiplier * this.getGlobalDamageMultiplier(),
+      damage: character.basicDamage * state.upgrades.basicDamageMultiplier * this.getGlobalDamageMultiplier() * (basicExpert ? 1.12 : 1),
       radius: 7 + Math.max(0, state.upgrades.basicProjectileSpeedMultiplier - 1) * 6,
       ttl: 1.2,
       color: character.basicColor
     });
 
+    if (basicExpert && Math.random() < 0.34) {
+      const sideAngle = Math.atan2(direction.y, direction.x) + randomRange(-0.22, 0.22);
+      this.spawnProjectile({
+        owner: "player",
+        x: player.x + Math.cos(sideAngle) * 24,
+        y: player.y + Math.sin(sideAngle) * 24,
+        direction: { x: Math.cos(sideAngle), y: Math.sin(sideAngle) },
+        speed: 720 * state.upgrades.basicProjectileSpeedMultiplier,
+        damage: character.basicDamage * 0.58 * state.upgrades.basicDamageMultiplier * this.getGlobalDamageMultiplier(),
+        radius: 5,
+        ttl: 1.1,
+        color: 0xffd166
+      });
+    }
+
     if (player.overdriveTime > 0) {
-      this.damageEnemy(target, 7 * state.upgrades.overdriveDamageMultiplier, 0xd7ff3f);
+      this.damageEnemy(target, 7 * state.upgrades.overdriveDamageMultiplier, 0xd7ff3f, { sourceSkillId: "thunder-overdrive" });
       this.fxEvents.push({
         kind: "bolt",
         points: [
@@ -1303,7 +1589,7 @@ export class GameSimulation {
 
   private checkWaveComplete(): void {
     const state = this.state;
-    if (state.mode === "tutorial" || state.mode === "training" || state.mode === "survival") {
+    if (state.mode === "tutorial" || state.mode === "training" || state.mode === "survival" || state.mode === "quick-demo") {
       return;
     }
     if (!state.waveActive || state.spawnQueue.length > 0 || state.enemies.length > 0) {
@@ -1317,6 +1603,7 @@ export class GameSimulation {
     if (state.mode === "adventure") {
       const clearResult = this.recordAdventureStageClear();
       this.addUnlockedAchievements(clearResult?.unlockedAchievements ?? []);
+      this.addCharacterQuestUnlocks(clearResult?.characterQuestUnlocks ?? []);
       const finalStageCleared = state.adventureStageIndex >= ADVENTURE_STAGES.length - 1;
       if (finalStageCleared) {
         state.victory = true;
@@ -1397,7 +1684,8 @@ export class GameSimulation {
       score: Math.max(0, state.player.score - state.adventureStageStartScore),
       seconds: Math.max(1, state.modeTime - state.adventureStageStartTime),
       hpRatio: state.player.hp / state.player.maxHp,
-      misses: Math.max(0, state.runStats.misses - state.adventureStageStartMisses)
+      misses: Math.max(0, state.runStats.misses - state.adventureStageStartMisses),
+      characterId: state.characterId
     }) ?? null;
   }
 
@@ -1456,13 +1744,173 @@ export class GameSimulation {
     };
   }
 
+  private updateObjectiveState(): void {
+    const state = this.state;
+    const setObjective = (text: string, detail: string, progress: number, urgent = false) => {
+      state.objectiveText = text;
+      state.objectiveDetail = detail;
+      state.objectiveProgress = clamp(progress, 0, 100);
+      state.objectiveIsUrgent = urgent || state.objectiveProgress >= 90;
+    };
+
+    if (state.mode === "title") {
+      setObjective("시작할 모드를 고르세요.", "튜토리얼, 훈련장, 모험을 선택할 수 있어요.", 0);
+      return;
+    }
+
+    if (state.pendingRewardIds.length > 0) {
+      setObjective("보상 카드 1장을 고르세요.", "이번 런의 빌드 방향을 정해요.", 100, true);
+      return;
+    }
+
+    if (state.victory) {
+      setObjective("클리어!", "기록, XP, 새 해금을 확인해요.", 100);
+      return;
+    }
+
+    if (state.gameOver) {
+      setObjective("재도전 준비", "다시 도전하거나 허브로 돌아갈 수 있어요.", 0);
+      return;
+    }
+
+    const bossType = this.getActiveObjectiveBossType();
+    if (bossType) {
+      const boss = state.enemies.find((enemy) => enemy.type === bossType);
+      const bossProgress = boss ? ((boss.maxHp - Math.max(0, boss.hp)) / Math.max(1, boss.maxHp)) * 100 : 0;
+      const challengeDetail = state.bossChallenge
+        ? `보스 포즈: ${gestureObjectiveLabel(state.bossChallenge.requiredGesture)}로 패턴을 끊어요.`
+        : "큰 패턴 전 보스 포즈 신호를 봐요.";
+      setObjective(`${bossDisplayName(bossType)} 처치`, challengeDetail, bossProgress, Boolean(state.bossChallenge) || bossProgress >= 70);
+      return;
+    }
+
+    if (state.mode === "tutorial") {
+      const step = state.tutorial.steps[state.tutorial.currentStepIndex];
+      const completed = state.tutorial.steps.filter((item) => item.completed).length;
+      const progress = (completed / Math.max(1, state.tutorial.steps.length)) * 100;
+      setObjective(
+        step ? step.title : "튜토리얼 완료",
+        step ? step.prompt : "포즈 캐스트 흐름을 익혔어요.",
+        progress,
+        progress >= 85
+      );
+      return;
+    }
+
+    if (state.mode === "training") {
+      const mission = state.training.missions.find((item) => !item.completed) ?? state.training.missions[state.training.missions.length - 1];
+      const totalTargets = state.training.missions.reduce((sum, item) => sum + item.targetSuccesses, 0);
+      const totalSuccesses = state.training.missions.reduce((sum, item) => sum + Math.min(item.successes, item.targetSuccesses), 0);
+      const progress = totalTargets > 0 ? (totalSuccesses / totalTargets) * 100 : 0;
+      setObjective(
+        mission ? `${gestureObjectiveLabel(mission.gestureId)} 5회 성공` : "포즈 미션 완료",
+        mission ? `${mission.title} · ${Math.min(mission.successes, mission.targetSuccesses)}/${mission.targetSuccesses} · ${mission.prompt}` : "모든 연습 미션 완료!",
+        progress,
+        Boolean(mission && !mission.completed && mission.successes >= mission.targetSuccesses - 1)
+      );
+      return;
+    }
+
+    if (state.mode === "quick-demo") {
+      const remainingSeconds = Math.max(0, QUICK_DEMO_DURATION - state.modeTime);
+      const phase = quickDemoPhases[Math.max(0, Math.min(state.quickDemo.phaseIndex, quickDemoPhases.length - 1))];
+      const phaseLabel =
+        state.quickDemo.phaseIndex <= 0
+          ? "Q를 누르고 슬래시 포즈를 해요."
+          : state.quickDemo.phaseIndex === 1
+            ? "보상 카드 1장을 고르고 웨이브를 정리해요."
+            : state.quickDemo.phaseIndex === 2
+              ? "새 적을 상대하며 AR 가이드를 확인해요."
+              : "드럼 노이즈의 보스 포즈 브레이크를 막아요!";
+      setObjective(
+        "3분 안에 핵심 재미를 체험해요.",
+        `${phase?.message ?? phaseLabel} · 남은 시간 ${formatObjectiveTime(remainingSeconds)} · ${phaseLabel}`,
+        (state.modeTime / QUICK_DEMO_DURATION) * 100,
+        remainingSeconds <= 20 || state.quickDemo.phaseIndex >= 3
+      );
+      return;
+    }
+
+    if (state.mode === "survival") {
+      const targetSeconds = 600;
+      const remainingSeconds = Math.max(0, targetSeconds - state.modeTime);
+      const progress = (state.modeTime / targetSeconds) * 100;
+      const rewardDetail =
+        state.modeTime >= state.survivalNextRewardAt - 8
+          ? "곧 보상 카드가 도착해요."
+          : `다음 보상까지 ${formatObjectiveTime(Math.max(0, state.survivalNextRewardAt - state.modeTime))}`;
+      setObjective(
+        "10분 동안 생존해요.",
+        `남은 시간 ${formatObjectiveTime(remainingSeconds)} · Wave ${state.waveIndex} · ${rewardDetail}`,
+        progress,
+        remainingSeconds <= 60 || state.modeTime >= state.survivalNextRewardAt - 8
+      );
+      return;
+    }
+
+    if (state.mode === "boss-rush") {
+      const current = Math.min(Math.max(1, state.bossRushIndex), bossRushPlan.length);
+      const nextBoss = bossRushPlan[Math.min(current - 1, bossRushPlan.length - 1)];
+      setObjective(
+        "보스 러시를 돌파해요.",
+        `${current}/${bossRushPlan.length} · ${bossDisplayName(nextBoss)} 준비`,
+        ((current - 1) / Math.max(1, bossRushPlan.length)) * 100,
+        current >= bossRushPlan.length
+      );
+      return;
+    }
+
+    if (state.mode === "adventure") {
+      const remaining = state.spawnQueue.length + state.enemies.length;
+      const total = Math.max(1, state.adventureStageEnemyTotal);
+      const progress = ((total - remaining) / total) * 100;
+      setObjective(
+        state.adventureStageGoal || "현재 스테이지를 클리어해요.",
+        `AREA ${state.adventureStageCode} · ${state.stageName} · 남은 노이즈 ${remaining}`,
+        progress,
+        remaining <= 2
+      );
+      return;
+    }
+
+    const currentWave = Math.max(1, state.waveIndex);
+    const totalWaves = wavePlans.length;
+    const currentPlan = wavePlans[Math.max(0, Math.min(currentWave - 1, totalWaves - 1))] ?? [];
+    const remaining = state.spawnQueue.length + state.enemies.length;
+    const waveProgress = currentPlan.length > 0 ? (currentPlan.length - remaining) / currentPlan.length : 1;
+    const progress = ((currentWave - 1 + clamp(waveProgress, 0, 1)) / totalWaves) * 100;
+    setObjective(
+      "5개의 웨이브를 돌파해요.",
+      `Wave ${currentWave}/${totalWaves} · 남은 노이즈 ${remaining}`,
+      progress,
+      currentWave >= totalWaves && remaining <= 2
+    );
+  }
+
+  private getActiveObjectiveBossType(): BossChallengeState["bossType"] | null {
+    const activeBoss = this.state.enemies.find((enemy) => isBossEnemy(enemy.type));
+    if (activeBoss && isBossEnemy(activeBoss.type)) {
+      return activeBoss.type;
+    }
+
+    return null;
+  }
+
   private startMode(): void {
+    if (this.state.mode === "title") {
+      this.startTitle();
+      return;
+    }
     if (this.state.mode === "tutorial") {
       this.startTutorial();
       return;
     }
     if (this.state.mode === "training") {
       this.startTraining();
+      return;
+    }
+    if (this.state.mode === "quick-demo") {
+      this.startQuickDemo();
       return;
     }
     if (this.state.mode === "adventure") {
@@ -1478,6 +1926,159 @@ export class GameSimulation {
       return;
     }
     this.startNextWave();
+  }
+
+  private startTitle(): void {
+    const state = this.state;
+    state.waveActive = false;
+    state.spawnQueue = [];
+    state.spawnTimer = 0;
+    state.stageName = "무브캐스터즈 데모";
+    this.setStageRegion("루프시티");
+    state.player.x = WORLD_WIDTH / 2;
+    state.player.y = WORLD_HEIGHT / 2;
+    state.player.gauge = Math.max(state.player.gauge, 60);
+    state.message = "타이틀";
+    state.enemies = [];
+    state.projectiles = [];
+    state.traps = [];
+    state.allies = [];
+    state.preparedSkill = null;
+    state.bossChallenge = null;
+  }
+
+  private startQuickDemo(): void {
+    const state = this.state;
+    state.stageName = "3분 데모";
+    this.setStageRegion("루프시티");
+    state.modeTime = 0;
+    state.waveIndex = 0;
+    state.bossRushIndex = 0;
+    state.survivalFinalBossSpawned = false;
+    state.survivalNextRewardAt = 60;
+    state.quickDemo = {
+      phaseIndex: -1,
+      rewardOffered: false,
+      bossSpawned: false,
+      bossChallengeStarted: false
+    };
+    state.waveActive = false;
+    state.spawnQueue = [];
+    state.spawnTimer = 0;
+    state.pendingRewardIds = [];
+    state.rewardOfferHistoryIds = [];
+    state.rewardRerollsRemaining = Math.max(state.rewardRerollsRemaining, 1);
+    state.player.x = WORLD_WIDTH / 2;
+    state.player.y = WORLD_HEIGHT / 2;
+    state.player.hp = state.player.maxHp;
+    state.player.shield = Math.max(state.player.shield, 18);
+    state.player.gauge = state.player.maxGauge;
+    state.enemies = [];
+    state.projectiles = [];
+    state.traps = [];
+    state.allies = [];
+    state.preparedSkill = null;
+    state.bossChallenge = null;
+    state.message = "3분 데모 시작";
+    this.startQuickDemoPhase(0);
+    this.pushCutIn("3분 데모", "Q 스킬, 보상 카드, AR 포즈, 보스 카운터까지 빠르게!", 0x48f7ff, 720);
+    this.fxEvents.push({ kind: "sound", sound: "cast-start" });
+  }
+
+  private startQuickDemoPhase(phaseIndex: number): void {
+    const state = this.state;
+    const phase = quickDemoPhases[phaseIndex];
+    if (!phase) {
+      return;
+    }
+
+    state.quickDemo.phaseIndex = phaseIndex;
+    state.stageName = phase.title;
+    this.setStageRegion(phase.region);
+    state.waveIndex = phaseIndex + 1;
+    state.message = phase.message;
+    state.player.gauge = clamp(state.player.gauge + (phaseIndex === 0 ? 100 : 36), 0, state.player.maxGauge);
+    state.projectiles = state.projectiles.filter((projectile) => projectile.owner === "player");
+
+    if (phaseIndex === 1 && !state.quickDemo.rewardOffered) {
+      state.spawnQueue = [...phase.enemies].sort(() => Math.random() - 0.5);
+      state.spawnTimer = 0.18;
+      state.waveActive = true;
+      state.quickDemo.rewardOffered = true;
+      this.openRewardChoice(3);
+      this.fxEvents.push({ kind: "float-text", x: state.player.x, y: state.player.y - 118, text: "BUILD PICK", color: 0xffd166 });
+      this.fxEvents.push({ kind: "sound", sound: "reward-rare" });
+      return;
+    }
+
+    if (phaseIndex === 3) {
+      state.enemies = state.enemies.filter((enemy) => isBossEnemy(enemy.type));
+      state.spawnQueue = [];
+      state.waveActive = true;
+      if (!state.quickDemo.bossSpawned) {
+        state.quickDemo.bossSpawned = true;
+        this.spawnEnemy("drum");
+        const boss = state.enemies.find((enemy) => enemy.type === "drum");
+        if (boss) {
+          boss.maxHp = Math.min(boss.maxHp, 360);
+          boss.hp = boss.maxHp;
+          boss.phase = 2;
+          boss.pulseCooldown = 1.2;
+          boss.shootCooldown = 1.8;
+          boss.slowTime = 0.4;
+          state.quickDemo.bossChallengeStarted = this.startBossChallenge(boss, {
+            bossType: "drum",
+            requiredGesture: "cross-guard",
+            prompt: "양팔을 X자로 모아 드럼 피날레를 막아요! 카메라가 없으면 1/2/3.",
+            successEffect: "drum-counter",
+            failDamage: 12,
+            duration: 3.05
+          });
+          if (state.quickDemo.bossChallengeStarted) {
+            boss.pulseCooldown = 5.2;
+          }
+        }
+      }
+      this.fxEvents.push({ kind: "float-text", x: state.player.x, y: state.player.y - 132, text: "MINI BOSS", color: 0xffd166 });
+      this.fxEvents.push({ kind: "sound", sound: "boss" });
+      return;
+    }
+
+    state.spawnQueue.push(...[...phase.enemies].sort(() => Math.random() - 0.5));
+    state.waveActive = true;
+    state.spawnTimer = Math.min(state.spawnTimer, 0.18);
+    this.fxEvents.push({
+      kind: "float-text",
+      x: state.player.x,
+      y: state.player.y - 116,
+      text: phaseIndex === 2 ? "CAMERA AR" : "DEMO START",
+      color: phaseIndex === 2 ? 0xff5ea8 : 0x48f7ff
+    });
+  }
+
+  private completeQuickDemo(victory: boolean, message: string): void {
+    const state = this.state;
+    if (state.victory || state.gameOver) {
+      return;
+    }
+
+    state.victory = victory;
+    state.gameOver = !victory;
+    state.message = message;
+    state.preparedSkill = null;
+    state.bossChallenge = null;
+    state.spawnQueue = [];
+    state.waveActive = false;
+    this.recordRunEnd(victory);
+    this.fxEvents.push({
+      kind: "burst",
+      x: state.player.x,
+      y: state.player.y,
+      radius: victory ? 270 : 190,
+      color: victory ? 0xb8ff5c : 0xff5ea8,
+      grade: victory ? "Perfect" : "Normal"
+    });
+    this.pushCutIn(victory ? "데모 완료" : "데모 실패", message, victory ? 0xb8ff5c : 0xff5ea8, 760);
   }
 
   private startTutorial(): void {
@@ -1548,7 +2149,7 @@ export class GameSimulation {
       text: `AREA ${stage.code}`,
       color: 0xffd166
     });
-    this.fxEvents.push({ kind: "sound", sound: stage.enemies.some((enemy) => enemy === "drum" || enemy === "mirror" || enemy === "zero") ? "boss" : "reward-common" });
+    this.fxEvents.push({ kind: "sound", sound: stage.enemies.some((enemy) => isBossEnemy(enemy)) ? "boss" : "reward-common" });
   }
 
   private startTraining(): void {
@@ -1687,7 +2288,7 @@ export class GameSimulation {
 
     if (step.id === "reward") {
       this.openRewardChoice(3);
-      state.message = "첫 보상 카드를 선택하세요";
+      state.message = "첫 보상 카드를 골라요.";
       return;
     }
 
@@ -1747,8 +2348,8 @@ export class GameSimulation {
     this.startBossChallenge(boss, {
       bossType: "drum",
       sequence: ["cross-guard"],
-      prompt: "팔을 X자로 교차해 드럼 노이즈의 리듬 폭격을 막으세요.",
-      stepPrompts: ["크로스 가드: 양팔을 X자로 교차"],
+      prompt: "양팔을 X자로 모아 리듬 폭격을 막아요!",
+      stepPrompts: ["크로스 가드: 양팔을 X자로 모아요"],
       successEffect: "drum-counter",
       failDamage: 8,
       duration: 3.4
@@ -1910,6 +2511,12 @@ export class GameSimulation {
       this.completeTutorialStep("reward");
       return;
     }
+    if (this.state.mode === "quick-demo") {
+      this.state.waveActive = true;
+      this.state.message = "3분 데모 재개";
+      this.state.player.gauge = clamp(this.state.player.gauge + 20, 0, this.state.player.maxGauge);
+      return;
+    }
     if (this.state.mode === "adventure") {
       this.state.adventureStageIndex = Math.min(this.state.adventureStageIndex + 1, ADVENTURE_STAGES.length);
       this.startAdventureStage();
@@ -1930,7 +2537,7 @@ export class GameSimulation {
   private spawnEnemy(type: EnemyType): void {
     const side = Math.floor(Math.random() * 4);
     const margin = 70;
-    const isBoss = type === "drum" || type === "mirror" || type === "zero";
+    const isBoss = isBossEnemy(type);
     const x = isBoss
       ? clamp(this.state.player.x + randomRange(250, 340), margin, WORLD_WIDTH - margin)
       : side === 0
@@ -1947,8 +2554,9 @@ export class GameSimulation {
           : randomRange(margin, WORLD_HEIGHT - margin);
     const waveScale = 1 + (this.state.waveIndex - 1) * 0.15;
     const stats = enemyStats(type, waveScale);
+    const difficultyModifiers = this.getDifficultyModifiers();
     const hpMultiplier = isBoss ? this.dailyModifiers.bossHpMultiplier : this.dailyModifiers.enemyHpMultiplier;
-    const hp = Math.round(stats.hp * hpMultiplier);
+    const hp = Math.round(stats.hp * hpMultiplier * difficultyModifiers.enemyHpMultiplier);
     const enemy: EnemyState = {
       id: this.nextEntityId++,
       type,
@@ -1957,7 +2565,7 @@ export class GameSimulation {
       radius: stats.radius,
       hp,
       maxHp: hp,
-      speed: randomRange(stats.speedMin, stats.speedMax) * this.dailyModifiers.enemySpeedMultiplier,
+      speed: randomRange(stats.speedMin, stats.speedMax) * this.dailyModifiers.enemySpeedMultiplier * difficultyModifiers.enemySpeedMultiplier,
       facing: normalize({ x: this.state.player.x - x, y: this.state.player.y - y }),
       phase: 1,
       phaseTriggered: { phase2: false, phase3: false },
@@ -1969,7 +2577,7 @@ export class GameSimulation {
     };
     this.state.enemies.push(enemy);
     this.addUnlockedAchievements(this.progression?.recordEnemySeen(type) ?? []);
-    if (type === "drum" || type === "mirror" || type === "zero") {
+    if (isBossEnemy(type)) {
       this.state.message = bossDisplayName(type);
       this.fxEvents.push({ kind: "sound", sound: "boss" });
       this.fxEvents.push({ kind: "shake", intensity: type === "zero" ? 0.018 : 0.012, duration: 240 });
@@ -2045,6 +2653,11 @@ export class GameSimulation {
       attackCooldown: 0.15,
       color: config.color
     });
+    this.updateMaxSlimesMaintained();
+  }
+
+  private updateMaxSlimesMaintained(): void {
+    this.state.runStats.maxSlimesMaintained = Math.max(this.state.runStats.maxSlimesMaintained, this.state.allies.length);
   }
 
   private resolveSkillEffect(skillId: string, grade: Exclude<CastGrade, "Miss">): void {
@@ -2102,7 +2715,7 @@ export class GameSimulation {
       const forward = dot(toEnemy, direction);
       if (forward > -20 && forward < range && perpendicularDistance(enemy, player, direction) < width) {
         hits += 1;
-        this.damageEnemy(enemy, damage, skill.color);
+        this.damageEnemy(enemy, damage, skill.color, { sourceSkillId: skill.id });
       }
     }
 
@@ -2150,7 +2763,7 @@ export class GameSimulation {
       const toEnemy = { x: enemy.x - start.x, y: enemy.y - start.y };
       const forward = dot(toEnemy, direction);
       if (forward > -30 && forward < length + 60 && perpendicularDistance(enemy, start, direction) < hitWidth) {
-        this.damageEnemy(enemy, damage, skill.color);
+        this.damageEnemy(enemy, damage, skill.color, { sourceSkillId: skill.id });
         if (state.upgrades.dashGaugeGain > 0) {
           player.gauge = clamp(player.gauge + state.upgrades.dashGaugeGain * 0.5, 0, player.maxGauge);
         }
@@ -2171,8 +2784,15 @@ export class GameSimulation {
     const player = state.player;
     const skill = this.getCurrentSkills().R;
     const comboBonus = player.comboRangeBonusTime > 0 ? 2 : 0;
-    const maxTargets = (grade === "Perfect" ? 7 : grade === "Great" ? 5 : 3) + state.upgrades.chainExtraTargets + comboBonus;
+    const maxTargets =
+      (grade === "Perfect" ? 7 : grade === "Great" ? 5 : 3) +
+      state.upgrades.chainExtraTargets +
+      comboBonus +
+      (this.hasSynergy("rio-chain-master") ? 2 : 0);
     let damage = skill.damageByGrade[grade] * state.upgrades.chainDamageMultiplier * this.getSkillDamageMultiplier();
+    if (this.hasSynergy("rio-chain-master")) {
+      damage *= 1.08;
+    }
     if (player.dashBuffTime > 0) {
       damage *= state.upgrades.dashSkillDamageMultiplier;
     }
@@ -2232,7 +2852,7 @@ export class GameSimulation {
 
     for (const enemy of [...state.enemies]) {
       if (distance(player, enemy) < radius) {
-        this.damageEnemy(enemy, damage, skill.color);
+        this.damageEnemy(enemy, damage, skill.color, { sourceSkillId: skill.id });
       }
     }
 
@@ -2497,10 +3117,11 @@ export class GameSimulation {
       const blastRadius = radius * 1.55;
       for (const enemy of [...state.enemies]) {
         if (distance(enemy, origin) < blastRadius + enemy.radius) {
-          this.damageEnemy(enemy, damage * 1.9, skill.color);
+          this.damageEnemy(enemy, damage * 1.9, skill.color, { sourceSkillId: skill.id });
           enemy.slowTime = Math.max(enemy.slowTime, 1.4);
         }
       }
+      this.addCharacterQuestUnlocks(this.progression?.recordCharacterQuestProgress("neon", "neon-trap-overlaps", 1, "add") ?? []);
       state.traps = state.traps.filter((trap) => !overlapping.includes(trap));
       this.fxEvents.push({ kind: "burst", x: origin.x, y: origin.y, radius: blastRadius, color: skill.color, grade });
       this.fxEvents.push({ kind: "shake", intensity: 0.015, duration: 160 });
@@ -2530,7 +3151,7 @@ export class GameSimulation {
       if (distance(player, enemy) < radius) {
         enemy.markedTime = Math.max(enemy.markedTime, grade === "Perfect" ? 10 : 7);
         enemy.slowTime = Math.max(enemy.slowTime, (grade === "Perfect" ? 4.8 : 3.2) + state.upgrades.blackoutSlowBonus);
-        this.damageEnemy(enemy, damage, skill.color);
+        this.damageEnemy(enemy, damage, skill.color, { sourceSkillId: skill.id });
       }
     }
 
@@ -2604,6 +3225,7 @@ export class GameSimulation {
       });
     }
     state.runStats.slimesSummoned += count;
+    this.addCharacterQuestUnlocks(this.progression?.recordCharacterQuestProgress("cookie", "cookie-slimes-summoned", count, "add") ?? []);
 
     this.fxEvents.push({ kind: "burst", x: player.x, y: player.y, radius: 150, color: skill.color, grade });
   }
@@ -2651,6 +3273,7 @@ export class GameSimulation {
       color: skill.color
     });
     state.runStats.slimesSummoned += 1;
+    this.addCharacterQuestUnlocks(this.progression?.recordCharacterQuestProgress("cookie", "cookie-slimes-summoned", 1, "add") ?? []);
 
     const smallCount = (grade === "Perfect" ? 5 : grade === "Great" ? 3 : 2) + state.upgrades.slimePartyBonus;
     for (let index = 0; index < smallCount; index += 1) {
@@ -2667,6 +3290,7 @@ export class GameSimulation {
       });
     }
     state.runStats.slimesSummoned += smallCount;
+    this.addCharacterQuestUnlocks(this.progression?.recordCharacterQuestProgress("cookie", "cookie-slimes-summoned", smallCount, "add") ?? []);
 
     this.fxEvents.push({ kind: "burst", x: player.x, y: player.y, radius, color: skill.color, grade });
     this.fxEvents.push({
@@ -2687,7 +3311,7 @@ export class GameSimulation {
         kind: "float-text",
         x: player.x,
         y: player.y - 92,
-        text: "CORE +",
+        text: "코어 +",
         color: 0xb8ff5c
       });
     }
@@ -2697,7 +3321,7 @@ export class GameSimulation {
         kind: "float-text",
         x: player.x,
         y: player.y - 106,
-        text: "RANGE UP",
+        text: "범위 강화",
         color: 0x48f7ff
       });
     }
@@ -2746,13 +3370,38 @@ export class GameSimulation {
 
   private getSkillDamageMultiplier(): number {
     const coreRunaway = this.hasSynergy("core-runaway") && this.state.player.gauge >= 90 ? 1.14 : 1;
-    return this.getGlobalDamageMultiplier() * this.state.upgrades.skillDamageMultiplier * coreRunaway;
+    const areaSweeper = this.hasSynergy("area-sweeper") ? 1.07 : 1;
+    const rioChainMaster = this.state.characterId === "rio" && this.hasSynergy("rio-chain-master") ? 1.04 : 1;
+    return this.getGlobalDamageMultiplier() * this.state.upgrades.skillDamageMultiplier * coreRunaway * areaSweeper * rioChainMaster;
   }
 
   private getDailySkillCastDamageMultiplier(gestureId: GestureResult["gestureId"], grade: CastGrade): number {
     const perfect = grade === "Perfect" ? this.dailyModifiers.perfectDamageMultiplier : 1;
     const oneHand = isOneHandGesture(gestureId) ? this.dailyModifiers.oneHandSkillDamageMultiplier : 1;
     return perfect * oneHand;
+  }
+
+  private updateDebugStats(): void {
+    const cutoff = this.state.time - 5;
+    this.debugDamageSamples = this.debugDamageSamples.filter((sample) => sample.at >= cutoff);
+    const totalDamage = this.debugDamageSamples.reduce((sum, sample) => sum + sample.amount, 0);
+    this.state.debugStats.dpsEstimate = totalDamage / 5;
+  }
+
+  private getDebugBossType(): EnemyType {
+    if (this.state.stageRegion === "놀이공원") {
+      return "balloonClown";
+    }
+    if (this.state.stageRegion === "미러 타워") {
+      return "crystalReflector";
+    }
+    if (this.state.stageRegion === "제로 존") {
+      return "zero";
+    }
+    if (this.state.mode === "boss-rush") {
+      return bossRushPlan[Math.min(this.state.bossRushIndex, bossRushPlan.length - 1)] ?? "drum";
+    }
+    return "drum";
   }
 
   private pushPerfectCastPresentation(color: number): void {
@@ -2773,21 +3422,22 @@ export class GameSimulation {
     state.activeSynergies = calculateActiveSynergies(state.characterId, state.runStats.rewardsChosen);
     const newlyCompleted = state.activeSynergies.filter((synergy) => !previousIds.has(synergy.id));
     for (const synergy of newlyCompleted) {
+      const color = synergyTierColor(synergy.tier);
       this.fxEvents.push({
         kind: "float-text",
         x: state.player.x,
         y: state.player.y - 138,
         text: "BUILD COMPLETE",
-        color: 0xffd166
+        color
       });
       this.fxEvents.push({
         kind: "float-text",
         x: state.player.x,
         y: state.player.y - 106,
         text: synergy.title,
-        color: 0x48f7ff
+        color: synergy.tier === "mythic" ? 0xff5ea8 : 0x48f7ff
       });
-      this.pushCutIn("BUILD COMPLETE", synergy.title, 0xffd166, 620);
+      this.pushCutIn("BUILD COMPLETE", `${synergy.title} · ${synergy.tier.toUpperCase()}`, color, synergy.tier === "mythic" ? 760 : 620);
       this.fxEvents.push({ kind: "sound", sound: "build-complete" });
     }
   }
@@ -2831,6 +3481,22 @@ export class GameSimulation {
         color: 0xd7ff3f
       });
     }
+
+    if (this.hasSynergy("rio-chain-master")) {
+      const extra = this.findNearestEnemy(state.player, 720);
+      if (extra) {
+        this.damageEnemy(extra, 16 * this.getGlobalDamageMultiplier(), 0xd7ff3f, { bypassFrontGuard: true });
+        this.fxEvents.push({
+          kind: "bolt",
+          points: [
+            { x: state.player.x, y: state.player.y },
+            { x: extra.x, y: extra.y }
+          ],
+          color: 0xd7ff3f,
+          grade: "Great"
+        });
+      }
+    }
   }
 
   private updateBossPhase(enemy: EnemyState): void {
@@ -2848,7 +3514,7 @@ export class GameSimulation {
   }
 
   private triggerBossPhase(enemy: EnemyState, phase: 2 | 3): void {
-    const color = enemy.type === "drum" ? 0xffd166 : enemy.type === "mirror" ? 0x48f7ff : 0xc7b8ff;
+    const color = bossAccentColor(enemy.type);
     const title = `${bossDisplayName(enemy.type)} PHASE ${phase}`;
     this.state.message = title;
     enemy.shootCooldown = 0.2;
@@ -2869,6 +3535,22 @@ export class GameSimulation {
       this.spawnDrumWarningCircles(enemy, phase === 3 ? 5 : 4);
       if (phase === 3) {
         this.startDrumComboChallenge(enemy);
+      }
+    } else if (enemy.type === "balloonClown") {
+      if (phase === 2) {
+        this.spawnBalloonSplit(enemy, 5);
+        this.spawnPartyBombCircles(enemy, 5);
+      } else {
+        this.spawnBalloonSplit(enemy, 7);
+        this.startBalloonChallenge(enemy);
+      }
+    } else if (enemy.type === "crystalReflector") {
+      if (phase === 2) {
+        this.spawnMirrorClone(enemy);
+        this.swapCrystalWithClone(enemy);
+      } else {
+        this.startCrystalChallenge(enemy);
+        this.fireCrystalLaser(enemy, normalize({ x: this.state.player.x - enemy.x, y: this.state.player.y - enemy.y }));
       }
     } else if (enemy.type === "mirror") {
       if (phase === 2) {
@@ -2902,6 +3584,76 @@ export class GameSimulation {
       });
     }
     this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 98, text: "BEAT DROP", color: 0xff7a2f });
+  }
+
+  private spawnPartyBombCircles(enemy: EnemyState, count: number): void {
+    const player = this.state.player;
+    for (let index = 0; index < count; index += 1) {
+      const angle = (Math.PI * 2 * index) / count + randomRange(-0.3, 0.3);
+      const aimed = index % 3 === 0;
+      this.spawnTrap({
+        kind: "drum-warning",
+        x: aimed ? player.x + randomRange(-70, 70) : enemy.x + Math.cos(angle) * randomRange(150, 460),
+        y: aimed ? player.y + randomRange(-70, 70) : enemy.y + Math.sin(angle) * randomRange(120, 360),
+        radius: enemy.phase >= 3 ? 118 : 98,
+        damage: enemy.phase >= 3 ? 17 : 13,
+        ttl: enemy.phase >= 3 ? 0.95 : 1.18,
+        color: 0xff8ac8
+      });
+    }
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 98, text: "PARTY BOMB", color: 0xff8ac8 });
+    this.fxEvents.push({ kind: "sound", sound: "boss-break-start" });
+  }
+
+  private performBalloonJump(enemy: EnemyState): void {
+    const player = this.state.player;
+    const oldX = enemy.x;
+    const oldY = enemy.y;
+    const angle = randomRange(0, Math.PI * 2);
+    const landingDistance = randomRange(110, enemy.phase >= 3 ? 210 : 170);
+    enemy.x = clamp(player.x + Math.cos(angle) * landingDistance, 90, WORLD_WIDTH - 90);
+    enemy.y = clamp(player.y + Math.sin(angle) * landingDistance, 90, WORLD_HEIGHT - 90);
+    const shockRadius = enemy.phase >= 3 ? 220 : 175;
+    if (distance(enemy, player) < shockRadius + player.radius) {
+      this.damagePlayer(enemy.phase >= 3 ? 17 : 12);
+      player.movementSlowTime = Math.max(player.movementSlowTime, 0.75);
+    }
+    this.fxEvents.push({ kind: "slash", x: oldX, y: oldY, angle: Math.atan2(enemy.y - oldY, enemy.x - oldX), length: distance({ x: oldX, y: oldY }, enemy), color: 0xff8ac8, grade: "Great" });
+    this.fxEvents.push({ kind: "burst", x: enemy.x, y: enemy.y, radius: shockRadius, color: 0xff8ac8, grade: enemy.phase >= 3 ? "Perfect" : "Great" });
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 96, text: "RUBBER JUMP", color: 0xffd166 });
+    this.fxEvents.push({ kind: "shake", intensity: 0.012, duration: 150 });
+  }
+
+  private spawnBalloonSplit(enemy: EnemyState, count: number): void {
+    const state = this.state;
+    for (let index = 0; index < count; index += 1) {
+      const type: EnemyType = index % 2 === 0 ? "bombNoise" : "swarm";
+      const stats = enemyStats(type, 1 + this.state.waveIndex * 0.05);
+      const difficultyModifiers = this.getDifficultyModifiers();
+      const angle = (Math.PI * 2 * index) / count + randomRange(-0.18, 0.18);
+      const hp = Math.round(stats.hp * this.dailyModifiers.enemyHpMultiplier * difficultyModifiers.enemyHpMultiplier);
+      const add: EnemyState = {
+        id: this.nextEntityId++,
+        type,
+        x: clamp(enemy.x + Math.cos(angle) * randomRange(70, 150), 28, WORLD_WIDTH - 28),
+        y: clamp(enemy.y + Math.sin(angle) * randomRange(70, 150), 28, WORLD_HEIGHT - 28),
+        radius: stats.radius,
+        hp,
+        maxHp: hp,
+        speed: randomRange(stats.speedMin, stats.speedMax) * this.dailyModifiers.enemySpeedMultiplier * difficultyModifiers.enemySpeedMultiplier,
+        facing: normalize({ x: state.player.x - enemy.x, y: state.player.y - enemy.y }),
+        phase: 1,
+        phaseTriggered: { phase2: false, phase3: false },
+        shootCooldown: randomRange(0.3, 1),
+        pulseCooldown: randomRange(0.7, 1.8),
+        markedTime: 0,
+        slowTime: 0,
+        hitFlash: 0
+      };
+      state.enemies.push(add);
+    }
+    this.fxEvents.push({ kind: "burst", x: enemy.x, y: enemy.y, radius: 220, color: 0xff8ac8, grade: "Great" });
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 112, text: "BALLOON SPLIT", color: 0xff8ac8 });
   }
 
   private fireMirrorCopiedSkill(enemy: EnemyState): void {
@@ -2982,11 +3734,33 @@ export class GameSimulation {
     return this.startBossChallenge(enemy, {
       bossType: "drum",
       sequence: ["cross-guard", "palm-push"],
-      prompt: "크로스 가드 후 팜 푸시로 피날레 비트를 밀어내세요",
-      stepPrompts: ["팔을 X자로 교차해 피날레 비트를 막으세요", "손바닥을 앞으로 밀어 반격하세요"],
+      prompt: "크로스 가드 후 팜 푸시로 피날레를 밀어요!",
+      stepPrompts: ["양팔을 X자로 모아 막아요", "손바닥을 앞으로 밀어 반격해요"],
       successEffect: "drum-combo-counter",
       failDamage: 24,
       duration: 2.1
+    });
+  }
+
+  private startBalloonChallenge(enemy: EnemyState): boolean {
+    return this.startBossChallenge(enemy, {
+      bossType: "balloonClown",
+      requiredGesture: "circle",
+      prompt: "손으로 큰 원을 그려 풍선을 빼요!",
+      successEffect: "balloon-deflate",
+      failDamage: 16,
+      duration: 2.15
+    });
+  }
+
+  private startCrystalChallenge(enemy: EnemyState): boolean {
+    return this.startBossChallenge(enemy, {
+      bossType: "crystalReflector",
+      requiredGesture: "focus-triangle",
+      prompt: "양손 삼각형으로 본체를 드러내요!",
+      successEffect: "crystal-reveal",
+      failDamage: 13,
+      duration: 2.25
     });
   }
 
@@ -2994,8 +3768,8 @@ export class GameSimulation {
     return this.startBossChallenge(enemy, {
       bossType: "mirror",
       sequence: ["slash", "focus-triangle"],
-      prompt: "슬래시 후 삼각 포커스로 거울 감옥을 깨세요",
-      stepPrompts: ["손을 날카롭게 휘둘러 첫 거울을 깨세요", "양손으로 삼각형을 만들어 감옥 핵을 조준하세요"],
+      prompt: "슬래시 후 삼각 포커스로 감옥을 깨요!",
+      stepPrompts: ["손을 날카롭게 휘둘러요", "양손 삼각형으로 핵을 조준해요"],
       successEffect: "mirror-prison-break",
       failDamage: 8,
       duration: 2.05
@@ -3007,8 +3781,8 @@ export class GameSimulation {
     return this.startBossChallenge(enemy, {
       bossType: "zero",
       sequence: ["open-arms", "rise", ultimateGesture],
-      prompt: "오픈 암, 라이즈, 궁극기 포즈로 제로 코어를 해방하세요",
-      stepPrompts: ["양팔을 크게 벌려 정지장을 찢으세요", "손을 위로 들어 코어를 끌어올리세요", "캐릭터 궁극기 포즈로 마무리하세요"],
+      prompt: "오픈 암, 라이즈, 궁극기 포즈로 제로 코어를 해방해요!",
+      stepPrompts: ["양팔을 크게 벌려 정지장을 찢어요", "손을 위로 들어 코어를 끌어올려요", "궁극기 포즈로 마무리해요"],
       successEffect: "zero-final-release",
       failDamage: 28,
       duration: 2.25
@@ -3019,14 +3793,20 @@ export class GameSimulation {
     enemy: EnemyState,
     challenge: BossChallengeConfig
   ): boolean {
-    return this.bossSystem.startBossChallenge(enemy, challenge);
+    const modifiers = this.getDifficultyModifiers();
+    return this.bossSystem.startBossChallenge(enemy, {
+      ...challenge,
+      duration: Math.max(1.15, challenge.duration + modifiers.bossChallengeTimeBonus)
+    });
   }
 
   private succeedBossChallenge(challenge: BossChallengeState, grade: Exclude<CastGrade, "Miss">): CastResponse {
+    this.state.debugStats.bossChallengeSuccesses += 1;
     return this.bossSystem.succeedBossChallenge(challenge, grade);
   }
 
   private failBossChallenge(challenge: BossChallengeState): CastResponse {
+    this.state.debugStats.bossChallengeFailures += 1;
     return this.bossSystem.failBossChallenge(challenge);
   }
 
@@ -3125,6 +3905,61 @@ export class GameSimulation {
     this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 78, text: "COPY", color: 0xc7b8ff });
   }
 
+  private fireCrystalLaser(enemy: EnemyState, direction: Vector2): void {
+    const player = this.state.player;
+    const dir = normalize(direction);
+    const length = enemy.phase >= 3 ? 980 : 820;
+    const width = enemy.phase >= 3 ? 76 : 58;
+    const hitPlayer = distance(enemy, player) < length && perpendicularDistance(player, enemy, dir) < width;
+
+    if (hitPlayer) {
+      this.damagePlayer(enemy.phase >= 3 ? 16 : 11);
+      player.controlReverseTime = Math.max(player.controlReverseTime, enemy.phase >= 3 ? 1.25 : 0.65);
+    }
+
+    this.fxEvents.push({
+      kind: "slash",
+      x: enemy.x,
+      y: enemy.y,
+      angle: Math.atan2(dir.y, dir.x),
+      length,
+      color: 0x48f7ff,
+      grade: enemy.phase >= 3 ? "Perfect" : "Great"
+    });
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 92, text: "MIRROR LASER", color: 0x48f7ff });
+  }
+
+  private swapCrystalWithClone(enemy: EnemyState): void {
+    let clone = this.state.enemies
+      .filter((item) => item.id !== enemy.id && (item.type === "runner" || item.type === "swarm" || item.type === "shieldNoise"))
+      .map((item) => ({ enemy: item, range: distance(item, enemy) }))
+      .filter((item) => item.range < 720)
+      .sort((a, b) => a.range - b.range)[0]?.enemy;
+
+    if (!clone) {
+      this.spawnMirrorClone(enemy);
+      clone = this.state.enemies
+        .filter((item) => item.id !== enemy.id && (item.type === "runner" || item.type === "swarm"))
+        .map((item) => ({ enemy: item, range: distance(item, enemy) }))
+        .sort((a, b) => a.range - b.range)[0]?.enemy;
+    }
+
+    if (!clone) {
+      return;
+    }
+
+    const oldX = enemy.x;
+    const oldY = enemy.y;
+    enemy.x = clone.x;
+    enemy.y = clone.y;
+    clone.x = oldX;
+    clone.y = oldY;
+    enemy.slowTime = Math.max(enemy.slowTime, 0.35);
+    this.fxEvents.push({ kind: "burst", x: enemy.x, y: enemy.y, radius: 170, color: 0x48f7ff, grade: "Great" });
+    this.fxEvents.push({ kind: "burst", x: clone.x, y: clone.y, radius: 110, color: 0xc7b8ff, grade: "Normal" });
+    this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 94, text: "PRISM SWAP", color: 0x48f7ff });
+  }
+
   private fireZeroMotionPulse(enemy: EnemyState): void {
     const state = this.state;
     const count = 18;
@@ -3215,9 +4050,12 @@ export class GameSimulation {
     const wasMarked = enemy.markedTime > 0;
     const typeMultiplier =
       (enemy.type === "runner" || enemy.type === "swarm" ? 1 + this.state.upgrades.swarmDamageBonus : 1) *
-      (enemy.type === "tank" || enemy.type === "drum" || enemy.type === "mirror" || enemy.type === "zero" ? 1 + this.state.upgrades.eliteDamageBonus : 1);
+      (enemy.type === "tank" || isBossEnemy(enemy.type) ? 1 + this.state.upgrades.eliteDamageBonus : 1) *
+      (isBossEnemy(enemy.type) && this.hasSynergy("dangerous-choice") ? 1.1 : 1);
     const finalAmount = this.applyEnemyDefense(enemy, amount * typeMultiplier, options);
     enemy.hp -= finalAmount;
+    this.debugDamageSamples.push({ at: this.state.time, amount: Math.max(0, finalAmount) });
+    this.updateDebugStats();
     enemy.hitFlash = 0.12;
     if (this.state.upgrades.enemySlowOnHitTime > 0) {
       enemy.slowTime = Math.max(enemy.slowTime, this.state.upgrades.enemySlowOnHitTime);
@@ -3248,6 +4086,7 @@ export class GameSimulation {
         if (wasMarked) {
           this.state.runStats.markedEnemyKills += 1;
         }
+        this.recordCharacterQuestKill(enemy, options);
         this.state.player.score += Math.round(
           scoreForEnemy(enemy.type) * this.getDailyEnemyScoreMultiplier(enemy.type) * this.state.upgrades.scoreMultiplier
         );
@@ -3262,6 +4101,7 @@ export class GameSimulation {
       if (isBossEnemy(enemy.type) && !this.state.runStats.bossesDefeated.includes(enemy.type)) {
         this.state.runStats.bossesDefeated.push(enemy.type);
       }
+      this.recordCharacterQuestKill(enemy, options);
       this.state.player.score += Math.round(
         scoreForEnemy(enemy.type) * this.getDailyEnemyScoreMultiplier(enemy.type) * this.state.upgrades.scoreMultiplier
       );
@@ -3299,6 +4139,21 @@ export class GameSimulation {
           });
         }
       }
+      if (this.hasSynergy("area-sweeper")) {
+        const blastRadius = 145;
+        let splashed = 0;
+        for (const other of [...this.state.enemies]) {
+          if (other.id === enemy.id || distance(enemy, other) > blastRadius + other.radius) {
+            continue;
+          }
+          splashed += 1;
+          other.slowTime = Math.max(other.slowTime, 0.35);
+          this.damageEnemy(other, 12, 0x48f7ff, { source: enemy, bypassFrontGuard: true });
+        }
+        if (splashed > 0) {
+          this.fxEvents.push({ kind: "burst", x: enemy.x, y: enemy.y, radius: blastRadius, color: 0x48f7ff, grade: "Great" });
+        }
+      }
       this.fxEvents.push({
         kind: "float-text",
         x: enemy.x,
@@ -3310,7 +4165,51 @@ export class GameSimulation {
     }
   }
 
+  private recordCharacterQuestKill(enemy: EnemyState, options: DamageEnemyOptions): void {
+    const characterId = this.state.characterId;
+    const unlocks: CharacterQuestUnlock[] = [];
+
+    if (characterId === "rio" && options.sourceSkillId === "lightning-dash") {
+      unlocks.push(...(this.progression?.recordCharacterQuestProgress("rio", "rio-lightning-dash-kills", 1, "add") ?? []));
+    }
+
+    if (isBossEnemy(enemy.type)) {
+      if (characterId === "rio" && (this.state.player.overdriveTime > 0 || options.sourceSkillId === "thunder-overdrive")) {
+        unlocks.push(...(this.progression?.recordCharacterQuestProgress("rio", "rio-overdrive-boss", 1, "complete") ?? []));
+      }
+      if (characterId === "neon" && options.sourceSkillId === "blackout") {
+        unlocks.push(...(this.progression?.recordCharacterQuestProgress("neon", "neon-blackout-boss", 1, "complete") ?? []));
+      }
+      if (characterId === "cookie" && options.sourceAllyKind === "big-slime") {
+        unlocks.push(...(this.progression?.recordCharacterQuestProgress("cookie", "cookie-big-slime-boss", 1, "complete") ?? []));
+      }
+    }
+
+    this.addCharacterQuestUnlocks(unlocks);
+  }
+
   private applyEnemyDefense(enemy: EnemyState, amount: number, options: DamageEnemyOptions): number {
+    if (enemy.type === "crystalReflector") {
+      if (options.bypassFrontGuard || enemy.markedTime > 0) {
+        return amount * 1.2;
+      }
+
+      const source = options.source ?? this.state.player;
+      const attackDirection = normalize({ x: source.x - enemy.x, y: source.y - enemy.y });
+      const frontal = dot(enemy.facing, attackDirection) > 0.42;
+      if (!frontal) {
+        return amount * 1.12;
+      }
+
+      if (enemy.hitFlash <= 0.04) {
+        this.fxEvents.push({ kind: "float-text", x: enemy.x, y: enemy.y - 68, text: "REFLECT", color: 0x48f7ff });
+        if (distance(enemy, this.state.player) < 760) {
+          this.damagePlayer(3);
+        }
+      }
+      return amount * 0.28;
+    }
+
     if (enemy.type !== "shieldNoise") {
       return amount;
     }
@@ -3340,6 +4239,16 @@ export class GameSimulation {
     const player = this.state.player;
     if (player.invulnerableTime > 0 || player.hurtCooldown > 0) {
       return;
+    }
+
+    if (this.hasSynergy("survival-caster")) {
+      player.shield = Math.max(player.shield, 18);
+      player.gauge = clamp(player.gauge + 6, 0, player.maxGauge);
+      amount *= 0.92;
+    }
+    if (this.hasSynergy("dangerous-choice") && player.hp / player.maxHp < 0.42) {
+      player.shield = Math.max(player.shield, 24);
+      amount *= 0.9;
     }
 
     const hpBefore = player.hp;
@@ -3374,7 +4283,11 @@ export class GameSimulation {
       return;
     }
     this.runReported = true;
-    this.state.runStats.dailyChallengeCleared = victory && this.state.mode !== "tutorial";
+    this.state.runStats.dailyChallengeCleared = victory && this.state.mode !== "tutorial" && this.state.mode !== "quick-demo";
+    this.runHistory?.recordFromState(this.state, victory, {
+      ...(this.runTelemetryProvider?.() ?? {}),
+      endReason: victory ? "victory" : this.state.player.hp <= 0 ? "player-defeated" : "run-ended"
+    });
     const summary = this.progression?.recordRun({
       characterId: this.state.characterId,
       mode: this.state.mode,
@@ -3382,12 +4295,13 @@ export class GameSimulation {
       score: this.state.player.score,
       seconds: this.state.modeTime || this.state.time,
       hpRatio: this.state.player.hp / this.state.player.maxHp,
-      bossClear: victory && this.state.mode !== "survival" && this.state.mode !== "tutorial",
+      bossClear: victory && this.state.mode !== "survival" && this.state.mode !== "tutorial" && this.state.mode !== "quick-demo",
       misses: this.state.runStats.misses,
       bossPosePerfectCounters: this.state.runStats.bossPosePerfectCounters,
       shieldDamageAbsorbed: this.state.runStats.shieldDamageAbsorbed,
       markedEnemyKills: this.state.runStats.markedEnemyKills,
       slimesSummoned: this.state.runStats.slimesSummoned,
+      maxSlimesMaintained: this.state.runStats.maxSlimesMaintained,
       bossesDefeated: this.state.runStats.bossesDefeated
     });
     if (!summary) {
@@ -3399,6 +4313,7 @@ export class GameSimulation {
     this.state.runStats.levelAfter = summary.levelAfter;
     this.state.runStats.unlockedItems = summary.unlockedItems;
     this.addUnlockedAchievements(summary.unlockedAchievements);
+    this.addCharacterQuestUnlocks(summary.characterQuestUnlocks);
     this.state.player.level = summary.levelAfter;
     this.fxEvents.push({
       kind: "float-text",
@@ -3411,6 +4326,10 @@ export class GameSimulation {
 
   private getDailyEnemyScoreMultiplier(type: EnemyType): number {
     return isBossEnemy(type) ? this.dailyModifiers.bossScoreMultiplier : 1;
+  }
+
+  private getDifficultyModifiers(state = this.state) {
+    return getAppliedDifficultyModifiers(state.difficulty, state.mode);
   }
 
   private addUnlockedAchievements(achievements: AchievementUnlock[]): void {
@@ -3433,6 +4352,41 @@ export class GameSimulation {
         text: achievement.title,
         color: 0x48f7ff
       });
+      this.fxEvents.push({ kind: "sound", sound: "unlock" });
+    }
+  }
+
+  private addCastProgressResult(result?: { unlockedAchievements: AchievementUnlock[]; characterQuestUnlocks: CharacterQuestUnlock[] }): void {
+    if (!result) {
+      return;
+    }
+    this.addUnlockedAchievements(result.unlockedAchievements);
+    this.addCharacterQuestUnlocks(result.characterQuestUnlocks);
+  }
+
+  private addCharacterQuestUnlocks(unlocks: CharacterQuestUnlock[]): void {
+    for (const unlock of unlocks) {
+      if (this.state.runStats.characterQuestUnlocks.some((item) => item.objectiveId === unlock.objectiveId)) {
+        continue;
+      }
+      this.state.runStats.characterQuestUnlocks.push(unlock);
+      this.fxEvents.push({
+        kind: "float-text",
+        x: this.state.player.x,
+        y: this.state.player.y - 176,
+        text: unlock.completedLine ? "QUEST LINE CLEAR" : "QUEST CLEAR",
+        color: unlock.completedLine ? 0xffd166 : 0x48f7ff
+      });
+      this.fxEvents.push({
+        kind: "float-text",
+        x: this.state.player.x,
+        y: this.state.player.y - 142,
+        text: unlock.objectiveTitle,
+        color: unlock.completedLine ? 0xff5ea8 : 0xb8ff5c
+      });
+      if (unlock.completedLine) {
+        this.pushCutIn("QUEST COMPLETE", `${unlock.questTitle} · ${unlock.rewardText}`, 0xffd166, 720);
+      }
       this.fxEvents.push({ kind: "sound", sound: "unlock" });
     }
   }
@@ -3501,6 +4455,10 @@ function characterSkillSound(characterId: CharacterId): SoundId {
 
 function bossDisplayName(type: EnemyType): string {
   switch (type) {
+    case "balloonClown":
+      return "풍선 광대";
+    case "crystalReflector":
+      return "크리스탈 리플렉터";
     case "drum":
       return "드럼 노이즈";
     case "mirror":
@@ -3509,6 +4467,48 @@ function bossDisplayName(type: EnemyType): string {
       return "제로 모션";
     default:
       return "노이즈";
+  }
+}
+
+function formatObjectiveTime(seconds: number): string {
+  const wholeSeconds = Math.max(0, Math.ceil(seconds));
+  const minutes = Math.floor(wholeSeconds / 60)
+    .toString()
+    .padStart(2, "0");
+  const remainder = (wholeSeconds % 60).toString().padStart(2, "0");
+  return `${minutes}:${remainder}`;
+}
+
+function gestureObjectiveLabel(gestureId: GestureResult["gestureId"]): string {
+  switch (gestureId) {
+    case "slash":
+      return "Slash";
+    case "thrust":
+      return "Thrust";
+    case "rise":
+      return "Rise";
+    case "open-arms":
+      return "Open Arms";
+    case "cross-guard":
+      return "Cross Guard";
+    case "palm-push":
+      return "Palm Push";
+    case "ground-slam":
+      return "Ground Slam";
+    case "point":
+      return "Point";
+    case "circle":
+      return "Circle";
+    case "wave":
+      return "Wave";
+    case "spread":
+      return "Spread";
+    case "heart":
+      return "Heart";
+    case "focus-triangle":
+      return "Focus Triangle";
+    default:
+      return "Pose";
   }
 }
 
@@ -3525,6 +4525,9 @@ function isOneHandGesture(gestureId: GestureResult["gestureId"]): boolean {
 
 function stageRegionForBoss(type: EnemyType): StageRegion {
   switch (type) {
+    case "balloonClown":
+      return "놀이공원";
+    case "crystalReflector":
     case "mirror":
       return "미러 타워";
     case "zero":
@@ -3532,6 +4535,37 @@ function stageRegionForBoss(type: EnemyType): StageRegion {
     case "drum":
     default:
       return "루프시티";
+  }
+}
+
+function bossAccentColor(type: EnemyType): number {
+  switch (type) {
+    case "balloonClown":
+      return 0xff8ac8;
+    case "crystalReflector":
+      return 0x48f7ff;
+    case "drum":
+      return 0xffd166;
+    case "mirror":
+      return 0xc7b8ff;
+    case "zero":
+      return 0xc7b8ff;
+    default:
+      return 0xffd166;
+  }
+}
+
+function synergyTierColor(tier: GameState["activeSynergies"][number]["tier"]): number {
+  switch (tier) {
+    case "mythic":
+      return 0xff5ea8;
+    case "signature":
+      return 0xffd166;
+    case "advanced":
+      return 0x48f7ff;
+    case "basic":
+    default:
+      return 0xb8ff5c;
   }
 }
 

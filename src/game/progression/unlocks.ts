@@ -85,8 +85,8 @@ export const UNLOCK_CONDITIONS: UnlockConditionDefinition[] = [
   {
     itemType: "core",
     itemId: "rhythm-core",
-    condition: "Perfect Cast 총 30회",
-    getProgress: (snapshot) => progress("Perfect Cast 총 30회", totalPerfectCasts(snapshot), 30, "회")
+    condition: "퍼펙트 캐스트 총 30회",
+    getProgress: (snapshot) => progress("퍼펙트 캐스트 총 30회", totalPerfectCasts(snapshot), 30, "회")
   },
   {
     itemType: "core",

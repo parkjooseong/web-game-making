@@ -1,13 +1,11 @@
 import Phaser from "phaser";
 import { isSoundEnabled, toggleSoundEnabled } from "../../game/audio/audioSettings";
-import { getCharacter } from "../../game/content/skills";
 import type { SkillSlot } from "../../game/input/actions";
 import { getEffectPaletteDefinition } from "../../game/progression/progression";
 import { GameSimulation, WORLD_HEIGHT, WORLD_WIDTH } from "../../game/simulation/GameSimulation";
+import type { PerformanceMonitor, PerformanceQuality } from "../../game/performance/PerformanceMonitor";
 import type {
   CastGrade,
-  CharacterId,
-  CharacterSkinId,
   EnemyState,
   EffectPaletteId,
   FxEvent,
@@ -17,7 +15,9 @@ import type {
   StageHazardState
 } from "../../game/simulation/types";
 import type { PoseService } from "../../game/pose/PoseService";
+import { CharacterRenderer } from "../render/CharacterRenderer";
 import type { Hud } from "../../ui/hud/Hud";
+import type { AccessibilitySettings } from "../../ui/accessibility/AccessibilitySettings";
 
 interface KeyMap {
   w: Phaser.Input.Keyboard.Key;
@@ -81,24 +81,16 @@ interface SoundConfig {
   cooldown?: number;
 }
 
-interface ChibiColors {
-  jacket: number;
-  trim: number;
-  pants: number;
-  hair: number;
-  skin: number;
-  shoe: number;
-  accent: number;
-}
-
 export class BattleScene extends Phaser.Scene {
   private worldGraphics!: Phaser.GameObjects.Graphics;
   private fxGraphics!: Phaser.GameObjects.Graphics;
   private gridGraphics!: Phaser.GameObjects.Graphics;
+  private readonly characterRenderer = new CharacterRenderer();
   private keys!: KeyMap;
   private viewFx: ViewFx[] = [];
   private floatingTexts: FloatingTextFx[] = [];
   private cinematicObjects: Phaser.GameObjects.GameObject[] = [];
+  private activeCutInTexts = 0;
   private zoomTween: Phaser.Tweens.Tween | null = null;
   private audioContext: AudioContext | null = null;
   private masterGain: GainNode | null = null;
@@ -106,13 +98,16 @@ export class BattleScene extends Phaser.Scene {
   private loopMode: ProceduralLoopMode = "none";
   private loopTimer = 0;
   private loopStep = 0;
+  private smoothedFps = 60;
   private bossChallengeCaptureKey = "";
   private backgroundKey = "";
+  private quickDemoFallbackHintShown = false;
 
   constructor(
     private readonly simulation: GameSimulation,
     private readonly poseService: PoseService,
-    private readonly hud: Hud
+    private readonly hud: Hud,
+    private readonly performanceMonitor: PerformanceMonitor
   ) {
     super("battle");
   }
@@ -122,6 +117,7 @@ export class BattleScene extends Phaser.Scene {
     this.gridGraphics = this.add.graphics();
     this.worldGraphics = this.add.graphics();
     this.fxGraphics = this.add.graphics();
+    this.characterRenderer.reset();
     this.ensureStageBackground(this.simulation.getState());
     this.events.once(Phaser.Scenes.Events.SHUTDOWN, () => {
       this.clearFloatingTexts();
@@ -162,17 +158,33 @@ export class BattleScene extends Phaser.Scene {
 
   update(_time: number, deltaMs: number): void {
     this.handleHotkeys();
+    this.performanceMonitor.recordFrame(deltaMs);
+    const instantFps = deltaMs > 0 ? 1000 / deltaMs : 60;
+    this.smoothedFps = this.smoothedFps * 0.92 + instantFps * 0.08;
     const input = this.readInput();
     this.simulation.update(deltaMs / 1000, input);
 
     const state = this.simulation.getState();
     this.ensureStageBackground(state);
+    this.maybeShowQuickDemoFallbackHint(state);
     this.handleBossChallengeCapture(state);
     this.updateProceduralLoop(state, deltaMs / 1000);
     this.cameras.main.centerOn(state.player.x, state.player.y);
     this.collectFx();
     this.drawWorld(deltaMs / 1000);
-    this.hud.update(state);
+    this.performanceMonitor.setSceneMetrics({
+      enemies: state.enemies.length,
+      projectiles: state.projectiles.length,
+      activePhaserTexts: this.activePhaserTextCount()
+    });
+    this.hud.update(
+      state,
+      this.performanceMonitor.getMetrics({
+        enemies: state.enemies.length,
+        projectiles: state.projectiles.length,
+        activePhaserTexts: this.activePhaserTextCount()
+      })
+    );
   }
 
   private handleHotkeys(): void {
@@ -187,6 +199,12 @@ export class BattleScene extends Phaser.Scene {
     void this.resumeAudio();
 
     const key = event.key.toLowerCase();
+    if (event.code === "Backquote" || (event.code === "KeyD" && event.shiftKey)) {
+      event.preventDefault();
+      const visible = this.hud.toggleDevPanel();
+      this.hud.showToast(visible ? "Dev panel ON" : "Dev panel OFF");
+      return;
+    }
     if (key === "escape") {
       this.simulation.togglePaused();
       return;
@@ -290,6 +308,12 @@ export class BattleScene extends Phaser.Scene {
     this.hud.showCastPrompt(skill);
 
     if (!this.poseService.isReady()) {
+      const state = this.simulation.getState();
+      this.hud.showToast(
+        state.mode === "quick-demo"
+          ? "카메라 OFF. 스킬 준비 후 1/2/3으로 테스트해요."
+          : "카메라 OFF. 1/2/3 대체 입력을 쓸 수 있어요."
+      );
       return;
     }
 
@@ -301,8 +325,32 @@ export class BattleScene extends Phaser.Scene {
     });
   }
 
+  private maybeShowQuickDemoFallbackHint(state: GameState): void {
+    if (state.mode !== "quick-demo") {
+      this.quickDemoFallbackHintShown = false;
+      return;
+    }
+    if (this.quickDemoFallbackHintShown || this.poseService.isReady() || state.modeTime > 12 || state.gameOver || state.victory) {
+      return;
+    }
+    this.quickDemoFallbackHintShown = true;
+    this.hud.showToast("카메라 OFF도 괜찮아요. 스킬 준비 후 1/2/3!");
+  }
+
   private debugCast(grade: Exclude<CastGrade, "Miss">): void {
-    const hadBossChallenge = Boolean(this.simulation.getState().bossChallenge);
+    const state = this.simulation.getState();
+    const accessibility = this.hud.getAccessibilitySettings();
+    const fallbackAllowed =
+      accessibility.keyboardFallbackEnabled || state.mode === "training" || state.mode === "tutorial" || state.mode === "quick-demo";
+    if (!fallbackAllowed) {
+      this.hud.showToast("1/2/3 대체 입력이 꺼져 있어요. 설정에서 켤 수 있어요.");
+      return;
+    }
+    if (!accessibility.keyboardFallbackEnabled && (state.mode === "training" || state.mode === "tutorial" || state.mode === "quick-demo")) {
+      this.hud.showToast(state.mode === "quick-demo" ? "3분 데모는 1/2/3을 임시 허용해요." : "튜토리얼/훈련장은 1/2/3 연습 입력을 허용해요.");
+    }
+
+    const hadBossChallenge = Boolean(state.bossChallenge);
     const response = this.simulation.castDebugGrade(grade);
     if (response.ok) {
       if (hadBossChallenge) {
@@ -341,9 +389,13 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private collectFx(): void {
+    const accessibility = this.hud.getAccessibilitySettings();
     for (const event of this.simulation.drainFxEvents()) {
       if (event.kind === "shake") {
-        this.cameras.main.shake(event.duration, event.intensity);
+        const shake = this.adjustShakeEvent(event, accessibility);
+        if (shake) {
+          this.cameras.main.shake(shake.duration, shake.intensity);
+        }
         continue;
       }
       if (event.kind === "sound") {
@@ -355,20 +407,115 @@ export class BattleScene extends Phaser.Scene {
         continue;
       }
       if (event.kind === "screen-flash") {
-        this.spawnScreenFlash(event);
+        const flash = this.adjustFlashEvent(event, accessibility);
+        if (flash) {
+          this.spawnScreenFlash(flash);
+        }
         continue;
       }
       if (event.kind === "cut-in") {
-        this.spawnCutIn(event);
+        const cutIn = this.adjustCutInEvent(event, accessibility);
+        if (cutIn) {
+          this.spawnCutIn(cutIn);
+        }
         continue;
       }
       if (event.kind === "zoom-pulse") {
-        this.triggerZoomPulse(event);
+        const zoom = this.adjustZoomEvent(event, accessibility);
+        if (zoom) {
+          this.triggerZoomPulse(zoom);
+        }
         continue;
       }
       const ttl = event.kind === "bolt" ? 0.2 : 0.34;
       this.viewFx.push({ event, age: 0, ttl });
     }
+  }
+
+  private adjustShakeEvent(
+    event: Extract<FxEvent, { kind: "shake" }>,
+    accessibility: AccessibilitySettings
+  ): Extract<FxEvent, { kind: "shake" }> | null {
+    if (accessibility.screenShake === "off" || accessibility.reducedMotion) {
+      return null;
+    }
+    const performanceScale = accessibility.performanceMode === "performance" ? 0.62 : accessibility.performanceMode === "balanced" ? 0.82 : 1;
+    if (accessibility.screenShake === "reduced") {
+      return {
+        ...event,
+        duration: Math.max(35, event.duration * 0.45 * performanceScale),
+        intensity: event.intensity * 0.38 * performanceScale
+      };
+    }
+    return {
+      ...event,
+      duration: Math.max(35, event.duration * performanceScale),
+      intensity: event.intensity * performanceScale
+    };
+  }
+
+  private adjustFlashEvent(
+    event: Extract<FxEvent, { kind: "screen-flash" }>,
+    accessibility: AccessibilitySettings
+  ): Extract<FxEvent, { kind: "screen-flash" }> | null {
+    if (accessibility.flashes === "off") {
+      return null;
+    }
+    const performanceScale = accessibility.performanceMode === "performance" ? 0.52 : accessibility.performanceMode === "balanced" ? 0.78 : 1;
+    if (accessibility.flashes === "reduced" || accessibility.reducedMotion) {
+      return {
+        ...event,
+        alpha: event.alpha * 0.35 * performanceScale,
+        duration: Math.max(45, event.duration * 0.48 * performanceScale)
+      };
+    }
+    return {
+      ...event,
+      alpha: event.alpha * performanceScale,
+      duration: Math.max(45, event.duration * (0.72 + performanceScale * 0.28))
+    };
+  }
+
+  private adjustCutInEvent(
+    event: Extract<FxEvent, { kind: "cut-in" }>,
+    accessibility: AccessibilitySettings
+  ): Extract<FxEvent, { kind: "cut-in" }> | null {
+    if (accessibility.flashes === "off") {
+      return null;
+    }
+    const performanceScale = accessibility.performanceMode === "performance" ? 0.72 : accessibility.performanceMode === "balanced" ? 0.88 : 1;
+    if (accessibility.flashes === "reduced" || accessibility.reducedMotion) {
+      return {
+        ...event,
+        duration: Math.max(240, event.duration * 0.62 * performanceScale)
+      };
+    }
+    return {
+      ...event,
+      duration: Math.max(260, event.duration * performanceScale)
+    };
+  }
+
+  private adjustZoomEvent(
+    event: Extract<FxEvent, { kind: "zoom-pulse" }>,
+    accessibility: AccessibilitySettings
+  ): Extract<FxEvent, { kind: "zoom-pulse" }> | null {
+    if (accessibility.screenShake === "off" || accessibility.reducedMotion) {
+      return null;
+    }
+    const performanceScale = accessibility.performanceMode === "performance" ? 0.62 : accessibility.performanceMode === "balanced" ? 0.82 : 1;
+    if (accessibility.screenShake === "reduced") {
+      return {
+        ...event,
+        zoom: 1 + (event.zoom - 1) * 0.38 * performanceScale,
+        duration: Math.max(55, event.duration * 0.55 * performanceScale)
+      };
+    }
+    return {
+      ...event,
+      zoom: 1 + (event.zoom - 1) * performanceScale,
+      duration: Math.max(55, event.duration * performanceScale)
+    };
   }
 
   private spawnScreenFlash(event: Extract<FxEvent, { kind: "screen-flash" }>): void {
@@ -428,6 +575,8 @@ export class BattleScene extends Phaser.Scene {
       .setOrigin(0.5, 0.5);
 
     container.add([graphics, title, subtitle]);
+    const cutInTextCount = event.subtitle ? 2 : 1;
+    this.activeCutInTexts += cutInTextCount;
     container.setScale(0.96);
     this.trackCinematicObject(container);
     this.tweens.add({
@@ -446,7 +595,10 @@ export class BattleScene extends Phaser.Scene {
       delay: Math.max(120, event.duration - 170),
       duration: 150,
       ease: "Cubic.easeIn",
-      onComplete: () => this.destroyCinematicObject(container)
+      onComplete: () => {
+        this.activeCutInTexts = Math.max(0, this.activeCutInTexts - cutInTextCount);
+        this.destroyCinematicObject(container);
+      }
     });
   }
 
@@ -491,7 +643,7 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private ensureStageBackground(state: GameState): void {
-    const key = `${state.mode}:${state.stageRegion}:${state.stageName}:${state.adventureStageCode}`;
+    const key = `${state.stageRegion}:${this.hud.getPerformanceMode()}`;
     if (this.backgroundKey === key) {
       return;
     }
@@ -528,16 +680,35 @@ export class BattleScene extends Phaser.Scene {
     this.gridGraphics.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
   }
 
+  private performanceMode(): PerformanceQuality {
+    return this.hud.getPerformanceMode();
+  }
+
+  private isPerformanceMode(): boolean {
+    return this.performanceMode() === "performance";
+  }
+
+  private backgroundDetailMultiplier(): number {
+    const multipliers: Record<PerformanceQuality, number> = {
+      high: 1,
+      balanced: 0.72,
+      performance: 0.42
+    };
+    return multipliers[this.performanceMode()];
+  }
+
   private drawGridOverlay(lineColor: number, borderColor: number, alpha: number): void {
-    this.gridGraphics.lineStyle(1, lineColor, alpha);
-    for (let x = 0; x <= WORLD_WIDTH; x += 80) {
+    const detail = this.backgroundDetailMultiplier();
+    const spacing = this.isPerformanceMode() ? 160 : this.performanceMode() === "balanced" ? 112 : 80;
+    this.gridGraphics.lineStyle(1, lineColor, alpha * (0.5 + detail * 0.5));
+    for (let x = 0; x <= WORLD_WIDTH; x += spacing) {
       this.gridGraphics.lineBetween(x, 0, x, WORLD_HEIGHT);
     }
-    for (let y = 0; y <= WORLD_HEIGHT; y += 80) {
+    for (let y = 0; y <= WORLD_HEIGHT; y += spacing) {
       this.gridGraphics.lineBetween(0, y, WORLD_WIDTH, y);
     }
 
-    this.gridGraphics.lineStyle(5, borderColor, 0.24);
+    this.gridGraphics.lineStyle(5, borderColor, 0.16 + detail * 0.08);
     this.gridGraphics.strokeRect(32, 32, WORLD_WIDTH - 64, WORLD_HEIGHT - 64);
   }
 
@@ -545,13 +716,17 @@ export class BattleScene extends Phaser.Scene {
     this.drawStageBase(0x080b13);
     this.drawLoopCityBlocks();
     this.drawStreetLayer();
-    this.drawCityProps();
+    if (!this.isPerformanceMode()) {
+      this.drawCityProps();
+    }
     this.drawLoopCityNeonAccents();
   }
 
   private drawAmusementParkStage(): void {
     const graphics = this.gridGraphics;
     this.drawStageBase(0x160b22);
+    const detail = this.backgroundDetailMultiplier();
+    const lightZoneLimit = this.isPerformanceMode() ? 2 : lightZoneCountForDetail(detail, 4);
 
     const lightZones = [
       { x: 150, y: 160, w: 520, h: 160, color: 0xff5ea8 },
@@ -559,7 +734,7 @@ export class BattleScene extends Phaser.Scene {
       { x: 205, y: 1030, w: 500, h: 150, color: 0x8c7aff },
       { x: 1440, y: 1035, w: 510, h: 150, color: 0xff5ea8 }
     ];
-    for (const zone of lightZones) {
+    for (const zone of lightZones.slice(0, lightZoneLimit)) {
       graphics.fillStyle(zone.color, 0.12);
       graphics.fillRoundedRect(zone.x, zone.y, zone.w, zone.h, 28);
       graphics.lineStyle(3, zone.color, 0.26);
@@ -574,8 +749,9 @@ export class BattleScene extends Phaser.Scene {
     graphics.fillStyle(0xff5ea8, 0.12);
     graphics.fillCircle(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, 258);
     graphics.lineStyle(4, 0xffd166, 0.52);
-    for (let index = 0; index < 16; index += 1) {
-      const angle = (Math.PI * 2 * index) / 16;
+    const spokeCount = this.isPerformanceMode() ? 8 : 16;
+    for (let index = 0; index < spokeCount; index += 1) {
+      const angle = (Math.PI * 2 * index) / spokeCount;
       graphics.lineBetween(
         WORLD_WIDTH / 2 + Math.cos(angle) * 64,
         WORLD_HEIGHT / 2 + Math.sin(angle) * 64,
@@ -588,8 +764,9 @@ export class BattleScene extends Phaser.Scene {
     graphics.lineStyle(5, 0xffffff, 0.32);
     graphics.strokeCircle(WORLD_WIDTH / 2, WORLD_HEIGHT / 2, 92);
 
-    for (let index = 0; index < 8; index += 1) {
-      const angle = (Math.PI * 2 * index) / 8 + 0.25;
+    const seatCount = this.isPerformanceMode() ? 4 : 8;
+    for (let index = 0; index < seatCount; index += 1) {
+      const angle = (Math.PI * 2 * index) / seatCount + 0.25;
       const x = WORLD_WIDTH / 2 + Math.cos(angle) * 190;
       const y = WORLD_HEIGHT / 2 + Math.sin(angle) * 190;
       graphics.fillStyle(index % 2 === 0 ? 0xffd166 : 0xff5ea8, 0.7);
@@ -600,27 +777,31 @@ export class BattleScene extends Phaser.Scene {
 
     this.drawTicketBooth(210, 500);
     this.drawTicketBooth(1690, 685);
-    this.drawBalloonCluster(360, 430, [0xff5ea8, 0xffd166, 0x8c7aff]);
-    this.drawBalloonCluster(1840, 420, [0x48f7ff, 0xffd166, 0xff5ea8]);
-    this.drawBalloonCluster(430, 970, [0xb8ff5c, 0xff5ea8, 0x8c7aff]);
+    if (!this.isPerformanceMode()) {
+      this.drawBalloonCluster(360, 430, [0xff5ea8, 0xffd166, 0x8c7aff]);
+      this.drawBalloonCluster(1840, 420, [0x48f7ff, 0xffd166, 0xff5ea8]);
+      this.drawBalloonCluster(430, 970, [0xb8ff5c, 0xff5ea8, 0x8c7aff]);
+    }
   }
 
   private drawMirrorTowerStage(): void {
     const graphics = this.gridGraphics;
     this.drawStageBase(0x08111d);
+    const tileSize = this.isPerformanceMode() ? 160 : this.performanceMode() === "balanced" ? 120 : 96;
 
-    for (let y = 0; y < WORLD_HEIGHT; y += 96) {
-      for (let x = 0; x < WORLD_WIDTH; x += 96) {
-        const alternate = (x / 96 + y / 96) % 2 === 0;
+    for (let y = 0; y < WORLD_HEIGHT; y += tileSize) {
+      for (let x = 0; x < WORLD_WIDTH; x += tileSize) {
+        const alternate = (Math.floor(x / tileSize) + Math.floor(y / tileSize)) % 2 === 0;
         graphics.fillStyle(alternate ? 0x102235 : 0x0b1828, 0.94);
-        graphics.fillRect(x, y, 96, 96);
+        graphics.fillRect(x, y, tileSize, tileSize);
         graphics.lineStyle(1, alternate ? 0x48f7ff : 0xc7b8ff, alternate ? 0.12 : 0.18);
-        graphics.strokeRect(x + 4, y + 4, 88, 88);
+        graphics.strokeRect(x + 4, y + 4, tileSize - 8, tileSize - 8);
       }
     }
 
     const shardColors = [0xc7b8ff, 0x48f7ff, 0xf6fbff, 0xff5ea8];
-    for (let index = 0; index < 30; index += 1) {
+    const shardCount = this.isPerformanceMode() ? 10 : this.performanceMode() === "balanced" ? 18 : 30;
+    for (let index = 0; index < shardCount; index += 1) {
       const x = 110 + ((index * 313) % (WORLD_WIDTH - 220));
       const y = 100 + ((index * 181) % (WORLD_HEIGHT - 200));
       const size = 28 + (index % 5) * 10;
@@ -632,7 +813,9 @@ export class BattleScene extends Phaser.Scene {
     }
 
     graphics.lineStyle(3, 0xf6fbff, 0.18);
-    for (let index = -4; index <= 6; index += 1) {
+    const lineStart = this.isPerformanceMode() ? -2 : -4;
+    const lineEnd = this.isPerformanceMode() ? 3 : 6;
+    for (let index = lineStart; index <= lineEnd; index += 1) {
       graphics.lineBetween(index * 260, WORLD_HEIGHT, index * 260 + 820, 0);
       graphics.lineBetween(index * 260 + 160, 0, index * 260 + 900, WORLD_HEIGHT);
     }
@@ -649,14 +832,16 @@ export class BattleScene extends Phaser.Scene {
 
     graphics.fillStyle(0x1a1724, 0.92);
     graphics.fillRect(0, 0, WORLD_WIDTH, WORLD_HEIGHT);
-    for (let index = 0; index < 24; index += 1) {
+    const glitchLineCount = this.isPerformanceMode() ? 10 : this.performanceMode() === "balanced" ? 16 : 24;
+    for (let index = 0; index < glitchLineCount; index += 1) {
       const y = 80 + ((index * 131) % (WORLD_HEIGHT - 160));
       const color = index % 3 === 0 ? 0xff5ea8 : index % 3 === 1 ? 0x8c7aff : 0x48f7ff;
       graphics.lineStyle(2 + (index % 3), color, 0.14 + (index % 2) * 0.08);
       graphics.lineBetween(80 + (index % 5) * 40, y, WORLD_WIDTH - 100 - (index % 4) * 46, y + ((index % 2) * 2 - 1) * 18);
     }
 
-    for (let index = 0; index < 8; index += 1) {
+    const circleCount = this.isPerformanceMode() ? 4 : this.performanceMode() === "balanced" ? 6 : 8;
+    for (let index = 0; index < circleCount; index += 1) {
       const x = 220 + ((index * 271) % (WORLD_WIDTH - 440));
       const y = 210 + ((index * 167) % (WORLD_HEIGHT - 420));
       graphics.lineStyle(2, 0xc7b8ff, 0.18);
@@ -668,7 +853,8 @@ export class BattleScene extends Phaser.Scene {
 
     graphics.lineStyle(8, 0x05070d, 0.55);
     graphics.strokeRect(16, 16, WORLD_WIDTH - 32, WORLD_HEIGHT - 32);
-    for (let index = 0; index < 42; index += 1) {
+    const edgeNoiseCount = this.isPerformanceMode() ? 16 : this.performanceMode() === "balanced" ? 28 : 42;
+    for (let index = 0; index < edgeNoiseCount; index += 1) {
       const edge = index % 4;
       const x = edge < 2 ? 24 + ((index * 97) % (WORLD_WIDTH - 48)) : edge === 2 ? 28 : WORLD_WIDTH - 28;
       const y = edge >= 2 ? 24 + ((index * 89) % (WORLD_HEIGHT - 48)) : edge === 0 ? 28 : WORLD_HEIGHT - 28;
@@ -690,6 +876,7 @@ export class BattleScene extends Phaser.Scene {
       { x: 1692, y: 1020, w: 360, h: 260, color: 0x101a28 }
     ];
 
+    const windowStep = this.isPerformanceMode() ? 2 : 1;
     for (const block of blocks) {
       graphics.fillStyle(0x05070d, 0.42);
       graphics.fillRoundedRect(block.x + 12, block.y + 14, block.w, block.h, 18);
@@ -698,8 +885,8 @@ export class BattleScene extends Phaser.Scene {
       graphics.lineStyle(2, 0x48f7ff, 0.12);
       graphics.strokeRoundedRect(block.x, block.y, block.w, block.h, 18);
 
-      for (let row = 0; row < Math.floor(block.h / 54); row += 1) {
-        for (let col = 0; col < Math.floor(block.w / 72); col += 1) {
+      for (let row = 0; row < Math.floor(block.h / 54); row += windowStep) {
+        for (let col = 0; col < Math.floor(block.w / 72); col += windowStep) {
           const lit = (row + col + block.x) % 3 !== 0;
           const color = lit ? (col % 2 === 0 ? 0x48f7ff : 0xffd166) : 0x263140;
           graphics.fillStyle(color, lit ? 0.34 : 0.24);
@@ -745,7 +932,8 @@ export class BattleScene extends Phaser.Scene {
       { x: 1814, y: 1146, w: 126, h: 26, color: 0xb8ff5c }
     ];
 
-    for (const sign of signs) {
+    const signLimit = this.performanceMode() === "balanced" ? 5 : signs.length;
+    for (const sign of signs.slice(0, signLimit)) {
       graphics.fillStyle(sign.color, 0.18);
       graphics.fillRoundedRect(sign.x - 8, sign.y - 8, sign.w + 16, sign.h + 16, 10);
       graphics.fillStyle(sign.color, 0.72);
@@ -761,7 +949,8 @@ export class BattleScene extends Phaser.Scene {
     graphics.lineStyle(5, 0xffd166, 0.7);
     graphics.lineBetween(WORLD_WIDTH / 2 + 264, WORLD_HEIGHT / 2 - 270, WORLD_WIDTH / 2 + 410, WORLD_HEIGHT / 2 - 270);
 
-    for (let index = 0; index < 18; index += 1) {
+    const utilityCount = this.performanceMode() === "balanced" ? 12 : 18;
+    for (let index = 0; index < utilityCount; index += 1) {
       const x = 120 + ((index * 313) % (WORLD_WIDTH - 240));
       const y = 120 + ((index * 197) % (WORLD_HEIGHT - 240));
       graphics.lineStyle(2, 0x314252, 0.72);
@@ -787,7 +976,8 @@ export class BattleScene extends Phaser.Scene {
       graphics.lineBetween(rail.x1, rail.y1, rail.x2, rail.y2);
     }
 
-    for (let index = 0; index < 22; index += 1) {
+    const accentCount = this.isPerformanceMode() ? 8 : this.performanceMode() === "balanced" ? 14 : 22;
+    for (let index = 0; index < accentCount; index += 1) {
       const x = 100 + ((index * 421) % (WORLD_WIDTH - 200));
       const y = index % 2 === 0 ? WORLD_HEIGHT / 2 - 265 : WORLD_HEIGHT / 2 + 265;
       const color = index % 3 === 0 ? 0xff5ea8 : index % 3 === 1 ? 0x48f7ff : 0xffd166;
@@ -848,7 +1038,7 @@ export class BattleScene extends Phaser.Scene {
       if (trap.kind === "drum-warning") {
         const warning = Math.max(0.08, Math.min(1, trap.ttl / 1.25));
         const pulse = 1 + Math.sin(this.time.now * 0.04 + trap.id) * 0.05;
-        graphics.fillStyle(0xff7a2f, 0.11 + (1 - warning) * 0.12);
+        graphics.fillStyle(trap.color, 0.11 + (1 - warning) * 0.12);
         graphics.fillCircle(trap.x, trap.y, trap.radius * pulse);
         graphics.lineStyle(7, 0xffd166, 0.28 + (1 - warning) * 0.44);
         graphics.strokeCircle(trap.x, trap.y, trap.radius * pulse);
@@ -895,15 +1085,19 @@ export class BattleScene extends Phaser.Scene {
                     ? 0x7dffb2
                     : enemy.type === "bombNoise"
                       ? 0xffd166
-            : enemy.type === "tank"
-              ? 0x8c7aff
-              : enemy.type === "drum"
-                ? 0xff7a2f
-                : enemy.type === "mirror"
-                  ? 0xc7b8ff
-                  : enemy.type === "zero"
-                    ? 0x222a44
-                : 0xffd166;
+                      : enemy.type === "balloonClown"
+                        ? 0xff8ac8
+                        : enemy.type === "crystalReflector"
+                          ? 0x48f7ff
+                          : enemy.type === "tank"
+                            ? 0x8c7aff
+                            : enemy.type === "drum"
+                              ? 0xff7a2f
+                              : enemy.type === "mirror"
+                                ? 0xc7b8ff
+                                : enemy.type === "zero"
+                                  ? 0x222a44
+                                  : 0xffd166;
       const fill = enemy.hitFlash > 0 ? 0xffffff : baseColor;
       graphics.fillStyle(0x0f1220, 0.9);
       graphics.fillCircle(enemy.x + 5, enemy.y + 7, enemy.radius + 4);
@@ -979,6 +1173,52 @@ export class BattleScene extends Phaser.Scene {
         graphics.fillRoundedRect(enemy.x - enemy.radius, enemy.y - enemy.radius * 0.78, enemy.radius * 2, enemy.radius * 1.56, 12);
         graphics.lineStyle(3, 0xffffff, 0.26);
         graphics.strokeRoundedRect(enemy.x - enemy.radius, enemy.y - enemy.radius * 0.78, enemy.radius * 2, enemy.radius * 1.56, 12);
+      } else if (enemy.type === "balloonClown") {
+        const bounce = Math.sin(this.time.now * 0.008 + enemy.id) * 5;
+        const squash = enemy.slowTime > 0 ? 0.78 : 1;
+        graphics.fillStyle(0x05070d, 0.5);
+        graphics.fillEllipse(enemy.x, enemy.y + enemy.radius * 0.82, enemy.radius * 1.5, enemy.radius * 0.32);
+        graphics.fillStyle(fill, 0.9);
+        graphics.fillEllipse(enemy.x, enemy.y + bounce, enemy.radius * 1.7, enemy.radius * 1.9 * squash);
+        graphics.lineStyle(5, 0xffd166, 0.72);
+        graphics.strokeEllipse(enemy.x, enemy.y + bounce, enemy.radius * 1.7, enemy.radius * 1.9 * squash);
+        graphics.fillStyle(0xffd166, 0.95);
+        graphics.fillTriangle(enemy.x, enemy.y - enemy.radius * 1.42 + bounce, enemy.x - 24, enemy.y - enemy.radius * 0.72 + bounce, enemy.x + 28, enemy.y - enemy.radius * 0.72 + bounce);
+        graphics.fillStyle(0xf6fbff, 0.92);
+        graphics.fillCircle(enemy.x - 18, enemy.y - 10 + bounce, 10);
+        graphics.fillCircle(enemy.x + 19, enemy.y - 10 + bounce, 10);
+        graphics.fillStyle(0x091018, 0.82);
+        graphics.fillCircle(enemy.x - 18, enemy.y - 10 + bounce, 4);
+        graphics.fillCircle(enemy.x + 19, enemy.y - 10 + bounce, 4);
+        graphics.fillStyle(0xff315f, 0.9);
+        graphics.fillCircle(enemy.x, enemy.y + 8 + bounce, 8);
+        graphics.lineStyle(4, 0xf6fbff, 0.58);
+        graphics.arc(enemy.x, enemy.y + 20 + bounce, 24, 0.1, Math.PI - 0.1);
+        const balloonColors = [0xff5ea8, 0xffd166, 0x8c7aff];
+        for (let index = 0; index < balloonColors.length; index += 1) {
+          const offset = (index - 1) * 28;
+          graphics.lineStyle(2, 0xf6fbff, 0.2);
+          graphics.lineBetween(enemy.x + offset * 0.45, enemy.y - enemy.radius * 0.3, enemy.x + offset, enemy.y - enemy.radius * 1.35 + bounce);
+          graphics.fillStyle(balloonColors[index], 0.74);
+          graphics.fillEllipse(enemy.x + offset, enemy.y - enemy.radius * 1.55 + bounce, 28, 38);
+        }
+      } else if (enemy.type === "crystalReflector") {
+        const pulse = 1 + Math.sin(this.time.now * 0.007 + enemy.id) * 0.06;
+        graphics.lineStyle(6, enemy.markedTime > 0 ? 0xff5ea8 : 0x48f7ff, enemy.markedTime > 0 ? 0.78 : 0.44);
+        graphics.strokeCircle(enemy.x, enemy.y, enemy.radius * 1.22 * pulse);
+        graphics.fillStyle(0x0a1d2e, 0.82);
+        graphics.fillTriangle(enemy.x, enemy.y - enemy.radius * 1.08, enemy.x - enemy.radius * 0.82, enemy.y, enemy.x, enemy.y + enemy.radius * 1.18);
+        graphics.fillStyle(fill, enemy.markedTime > 0 ? 0.96 : 0.78);
+        graphics.fillTriangle(enemy.x, enemy.y - enemy.radius * 1.08, enemy.x + enemy.radius * 0.82, enemy.y, enemy.x, enemy.y + enemy.radius * 1.18);
+        graphics.lineStyle(3, 0xf6fbff, 0.45);
+        graphics.lineBetween(enemy.x, enemy.y - enemy.radius, enemy.x, enemy.y + enemy.radius);
+        graphics.lineBetween(enemy.x - enemy.radius * 0.65, enemy.y, enemy.x + enemy.radius * 0.65, enemy.y);
+        graphics.lineStyle(4, 0xff5ea8, enemy.markedTime > 0 ? 0.7 : 0.28);
+        graphics.strokeTriangle(enemy.x, enemy.y - 30, enemy.x - 34, enemy.y + 26, enemy.x + 34, enemy.y + 26);
+        const faceX = enemy.x + enemy.facing.x * enemy.radius * 0.78;
+        const faceY = enemy.y + enemy.facing.y * enemy.radius * 0.78;
+        graphics.lineStyle(5, 0x48f7ff, 0.58);
+        graphics.lineBetween(enemy.x, enemy.y, faceX, faceY);
       } else if (enemy.type === "drum") {
         graphics.fillCircle(enemy.x, enemy.y, enemy.radius);
         graphics.lineStyle(7, 0xffd166, 0.72);
@@ -1016,7 +1256,7 @@ export class BattleScene extends Phaser.Scene {
       const hpWidth =
         enemy.type === "zero"
           ? 136
-          : enemy.type === "drum" || enemy.type === "mirror"
+          : isBossEnemyType(enemy.type)
             ? 106
             : enemy.type === "tank" || enemy.type === "shieldNoise"
               ? 64
@@ -1139,7 +1379,7 @@ export class BattleScene extends Phaser.Scene {
     const x = view.centerX - width / 2;
     const y = view.y + 22;
     const hpRatio = Math.max(0, boss.hp / boss.maxHp);
-    const color = boss.type === "drum" ? 0xffd166 : boss.type === "mirror" ? 0x48f7ff : 0xc7b8ff;
+    const color = bossRenderColor(boss.type);
 
     graphics.fillStyle(0x05070d, 0.82);
     graphics.fillRoundedRect(x - 14, y - 20, width + 28, 58, 8);
@@ -1160,158 +1400,7 @@ export class BattleScene extends Phaser.Scene {
   }
 
   private drawPlayer(graphics: Phaser.GameObjects.Graphics): void {
-    const player = this.simulation.getState().player;
-    const state = this.simulation.getState();
-    const character = getCharacter(state.characterId);
-    const effectPalette = getEffectPaletteDefinition(state.effectPaletteId);
-    const colors = getChibiColors(state.characterId, state.equippedSkinId, character.color);
-    const glowColor = player.overdriveTime > 0 ? effectPalette.secondary : player.invulnerableTime > 0 ? 0xffd166 : effectPalette.primary;
-    const facingAngle = Math.atan2(player.facing.y, player.facing.x);
-
-    graphics.fillStyle(0x05070d, 0.9);
-    graphics.fillEllipse(player.x + 7, player.y + 9, player.radius * 2.45, player.radius * 1.88);
-    graphics.lineStyle(5, glowColor, 0.52);
-    graphics.strokeCircle(player.x, player.y, player.radius + 10 + Math.sin(this.time.now * 0.012) * 3);
-
-    if (state.characterId === "rio") {
-      this.drawRio(graphics, player.x, player.y, facingAngle, colors);
-    } else if (state.characterId === "maru") {
-      this.drawMaru(graphics, player.x, player.y, facingAngle, colors);
-    } else if (state.characterId === "neon") {
-      this.drawNeon(graphics, player.x, player.y, facingAngle, colors);
-    } else {
-      this.drawCookie(graphics, player.x, player.y, facingAngle, colors);
-    }
-
-    if (player.shield > 0) {
-      graphics.lineStyle(3, 0xb8ff5c, 0.8);
-      graphics.strokeCircle(player.x, player.y, player.radius + 18);
-    }
-    if (player.shieldWallTime > 0) {
-      graphics.lineStyle(5, effectPalette.primary, 0.5);
-      graphics.strokeCircle(player.x, player.y, 165 + Math.sin(this.time.now * 0.014) * 8);
-    }
-    if (player.overdriveTime > 0) {
-      graphics.lineStyle(4, effectPalette.secondary, 0.58);
-      graphics.strokeCircle(player.x, player.y, player.radius + 30 + Math.sin(this.time.now * 0.018) * 6);
-    }
-  }
-
-  private drawRio(graphics: Phaser.GameObjects.Graphics, x: number, y: number, angle: number, colors: ChibiColors): void {
-    const hand = pointAt(x, y - 1, angle, 40);
-    const trail = pointAt(x, y, angle + Math.PI, 64);
-    graphics.lineStyle(7, colors.accent, 0.45);
-    graphics.lineBetween(x - 8, y + 16, trail.x, trail.y);
-    graphics.lineStyle(5, colors.trim, 0.5);
-    graphics.lineBetween(x + 8, y + 18, trail.x + 16, trail.y - 8);
-    this.drawChibiBase(graphics, x, y, colors);
-    graphics.fillStyle(colors.trim, 1);
-    graphics.fillRoundedRect(x + 13, y - 2, 23, 18, 5);
-    graphics.lineStyle(4, colors.accent, 0.96);
-    const boltA = pointAt(hand.x, hand.y, angle + 2.8, 16);
-    const boltC = pointAt(hand.x, hand.y, angle - 0.25, 28);
-    graphics.lineBetween(boltA.x, boltA.y, hand.x, hand.y);
-    graphics.lineBetween(hand.x, hand.y, boltC.x, boltC.y);
-    graphics.fillStyle(colors.accent, 1);
-    graphics.fillCircle(hand.x, hand.y, 7);
-  }
-
-  private drawMaru(graphics: Phaser.GameObjects.Graphics, x: number, y: number, angle: number, colors: ChibiColors): void {
-    this.drawChibiBase(graphics, x, y, colors);
-    graphics.fillStyle(colors.trim, 0.95);
-    graphics.fillTriangle(x - 16, y - 44, x - 31, y - 65, x - 22, y - 37);
-    graphics.fillTriangle(x + 16, y - 44, x + 31, y - 65, x + 22, y - 37);
-    const front = pointAt(x, y, angle, 27);
-    graphics.fillStyle(colors.pants, 1);
-    graphics.lineStyle(4, 0xf6fbff, 0.32);
-    graphics.fillRoundedRect(front.x - 25, front.y - 28, 50, 56, 16);
-    graphics.strokeRoundedRect(front.x - 25, front.y - 28, 50, 56, 16);
-    graphics.lineStyle(5, colors.accent, 0.92);
-    graphics.strokeRoundedRect(front.x - 18, front.y - 22, 36, 44, 12);
-    graphics.lineStyle(3, colors.trim, 0.8);
-    graphics.lineBetween(front.x - 12, front.y, front.x + 12, front.y);
-    graphics.lineBetween(front.x, front.y - 15, front.x, front.y + 15);
-  }
-
-  private drawNeon(graphics: Phaser.GameObjects.Graphics, x: number, y: number, angle: number, colors: ChibiColors): void {
-    const phase = Math.sin(this.time.now * 0.045) * 3;
-    this.drawChibiBase(graphics, x, y, colors);
-    graphics.fillStyle(colors.pants, 0.94);
-    graphics.lineStyle(4, colors.trim, 0.8);
-    graphics.fillTriangle(x, y - 72, x - 31, y - 31, x + 31, y - 31);
-    graphics.strokeTriangle(x, y - 72, x - 31, y - 31, x + 31, y - 31);
-    const front = pointAt(x, y - 17, angle, 34);
-    graphics.lineStyle(4, colors.accent, 0.85);
-    graphics.lineBetween(front.x - 13, front.y - 2, front.x + 13, front.y - 2);
-    graphics.lineStyle(2, 0xffffff, 0.5);
-    graphics.lineBetween(x - 22 + phase, y - 22, x - 6 + phase, y - 22);
-    graphics.lineBetween(x + 6 - phase, y + 22, x + 24 - phase, y + 22);
-  }
-
-  private drawCookie(graphics: Phaser.GameObjects.Graphics, x: number, y: number, angle: number, colors: ChibiColors): void {
-    this.drawChibiBase(graphics, x, y, colors);
-    graphics.fillStyle(0xffffff, 0.92);
-    graphics.fillCircle(x - 17, y - 60, 11);
-    graphics.fillCircle(x, y - 67, 14);
-    graphics.fillCircle(x + 17, y - 60, 11);
-    graphics.fillStyle(colors.accent, 0.92);
-    graphics.fillEllipse(x - 29, y + 24, 21, 13);
-    graphics.fillEllipse(x + 29, y + 23, 23, 14);
-    const ladle = pointAt(x, y - 4, angle, 43);
-    graphics.lineStyle(4, colors.trim, 0.92);
-    graphics.lineBetween(x + 18, y - 4, ladle.x, ladle.y);
-    graphics.fillStyle(colors.trim, 1);
-    graphics.fillCircle(ladle.x, ladle.y, 6);
-  }
-
-  private drawChibiBase(
-    graphics: Phaser.GameObjects.Graphics,
-    x: number,
-    y: number,
-    colors: { jacket: number; trim: number; pants: number; hair: number; skin: number; shoe: number }
-  ): void {
-    graphics.lineStyle(11, 0x071018, 0.78);
-    graphics.lineBetween(x - 11, y + 27, x - 19, y + 45);
-    graphics.lineBetween(x + 11, y + 27, x + 19, y + 45);
-    graphics.lineStyle(8, colors.pants, 1);
-    graphics.lineBetween(x - 11, y + 27, x - 19, y + 45);
-    graphics.lineBetween(x + 11, y + 27, x + 19, y + 45);
-    graphics.fillStyle(colors.shoe, 1);
-    graphics.fillEllipse(x - 21, y + 48, 19, 9);
-    graphics.fillEllipse(x + 21, y + 48, 19, 9);
-
-    graphics.lineStyle(11, 0x071018, 0.72);
-    graphics.lineBetween(x - 22, y - 2, x - 42, y + 16);
-    graphics.lineBetween(x + 22, y - 2, x + 42, y + 16);
-    graphics.lineStyle(8, colors.jacket, 1);
-    graphics.lineBetween(x - 22, y - 2, x - 42, y + 16);
-    graphics.lineBetween(x + 22, y - 2, x + 42, y + 16);
-    graphics.fillStyle(colors.skin, 1);
-    graphics.fillCircle(x - 43, y + 17, 6);
-    graphics.fillCircle(x + 43, y + 17, 6);
-
-    graphics.fillStyle(0x071018, 0.82);
-    graphics.fillRoundedRect(x - 25, y - 8, 50, 47, 15);
-    graphics.fillStyle(colors.jacket, 1);
-    graphics.fillRoundedRect(x - 21, y - 12, 42, 48, 14);
-    graphics.lineStyle(4, 0xf6fbff, 0.28);
-    graphics.strokeRoundedRect(x - 21, y - 12, 42, 48, 14);
-    graphics.lineStyle(5, colors.trim, 0.92);
-    graphics.lineBetween(x - 14, y + 5, x + 14, y + 5);
-
-    graphics.fillStyle(colors.skin, 1);
-    graphics.fillCircle(x, y - 36, 22);
-    graphics.lineStyle(4, 0xf6fbff, 0.28);
-    graphics.strokeCircle(x, y - 36, 22);
-    graphics.fillStyle(colors.hair, 1);
-    graphics.fillEllipse(x, y - 50, 43, 25);
-    graphics.fillTriangle(x - 21, y - 41, x - 6, y - 63, x + 4, y - 42);
-    graphics.fillTriangle(x + 2, y - 42, x + 17, y - 61, x + 22, y - 41);
-    graphics.fillStyle(0x071018, 0.72);
-    graphics.fillCircle(x - 8, y - 35, 3.5);
-    graphics.fillCircle(x + 8, y - 35, 3.5);
-    graphics.lineStyle(2, 0x071018, 0.64);
-    graphics.lineBetween(x - 6, y - 24, x + 6, y - 24);
+    this.characterRenderer.drawPlayer(graphics, this.simulation.getState(), this.time.now);
   }
 
   private drawFx(dt: number): void {
@@ -1388,6 +1477,10 @@ export class BattleScene extends Phaser.Scene {
     this.floatingTexts = [];
   }
 
+  private activePhaserTextCount(): number {
+    return this.floatingTexts.length + this.activeCutInTexts;
+  }
+
   private trackCinematicObject(object: Phaser.GameObjects.GameObject): void {
     this.cinematicObjects.push(object);
   }
@@ -1404,6 +1497,7 @@ export class BattleScene extends Phaser.Scene {
       object.destroy();
     }
     this.cinematicObjects = [];
+    this.activeCutInTexts = 0;
   }
 
   private async resumeAudio(): Promise<void> {
@@ -1556,11 +1650,15 @@ function hexColor(color: number): string {
 
 function isLargeFloatingText(text: string): boolean {
   const normalized = text.toUpperCase();
-  return ["PERFECT", "STAGE CLEAR", "OVERDRIVE", "CORE DRAIN", "BOSS", "CLEAR", "PHASE", "BUILD"].some((token) => normalized.includes(token));
+  return ["PERFECT", "STAGE CLEAR", "OVERDRIVE", "CORE DRAIN", "BOSS", "CLEAR", "PHASE", "BUILD", "퍼펙트", "스테이지", "오버드라이브", "코어", "보스", "클리어", "페이즈", "빌드"].some((token) => normalized.includes(token));
 }
 
 function easeOutCubic(value: number): number {
   return 1 - Math.pow(1 - value, 3);
+}
+
+function lightZoneCountForDetail(detail: number, max: number): number {
+  return Math.max(1, Math.min(max, Math.round(max * detail)));
 }
 
 function isRenderHazardActive(hazard: StageHazardState, time: number): boolean {
@@ -1574,36 +1672,23 @@ function isRenderHazardActive(hazard: StageHazardState, time: number): boolean {
 }
 
 function isBossEnemyType(type: EnemyState["type"]): boolean {
-  return type === "drum" || type === "mirror" || type === "zero";
+  return type === "balloonClown" || type === "crystalReflector" || type === "drum" || type === "mirror" || type === "zero";
 }
 
-function getChibiColors(characterId: CharacterId, skinId: CharacterSkinId, baseColor: number): ChibiColors {
-  const defaults: Record<CharacterId, ChibiColors> = {
-    rio: { jacket: baseColor, trim: 0xffd166, pants: 0x1c2a3d, hair: 0x162238, skin: 0xffd0b5, shoe: 0xd7ff3f, accent: 0xd7ff3f },
-    maru: { jacket: baseColor, trim: 0x7dffb2, pants: 0x2a2442, hair: 0x4b2d52, skin: 0xf2c3aa, shoe: 0xffd166, accent: 0xffd166 },
-    neon: { jacket: 0x221a3a, trim: baseColor, pants: 0x0a0e1a, hair: 0x0a0e1a, skin: 0xd9c0c8, shoe: 0x48f7ff, accent: 0x48f7ff },
-    cookie: { jacket: baseColor, trim: 0xffd166, pants: 0xa64a7a, hair: 0xa64a7a, skin: 0xffd0b5, shoe: 0x7dffb2, accent: 0x7dffb2 }
-  };
-
-  switch (skinId) {
-    case "rio-racer":
-      return { jacket: 0xffd166, trim: 0x48f7ff, pants: 0x172235, hair: 0x162238, skin: 0xffd0b5, shoe: 0xff5ea8, accent: 0xd7ff3f };
-    case "rio-ninja":
-      return { jacket: 0x151a25, trim: 0xb8ff5c, pants: 0x0b1019, hair: 0x071018, skin: 0xffc8ad, shoe: 0x48f7ff, accent: 0xb8ff5c };
-    case "maru-knight":
-      return { jacket: 0x7dffb2, trim: 0xf6fbff, pants: 0x263348, hair: 0x635178, skin: 0xf2c3aa, shoe: 0xffd166, accent: 0xffd166 };
-    case "maru-pajama":
-      return { jacket: 0xffb3d9, trim: 0xb8ff5c, pants: 0x6c5485, hair: 0x5b3a63, skin: 0xf2c3aa, shoe: 0xf6fbff, accent: 0xffd166 };
-    case "neon-hacker":
-      return { jacket: 0x102433, trim: 0x48f7ff, pants: 0x080e18, hair: 0x071018, skin: 0xd9c0c8, shoe: 0xb8ff5c, accent: 0xff5ea8 };
-    case "neon-idol":
-      return { jacket: 0xff5ea8, trim: 0xc7b8ff, pants: 0x251336, hair: 0x2c183f, skin: 0xffd0d8, shoe: 0x48f7ff, accent: 0xffd166 };
-    case "cookie-patissier":
-      return { jacket: 0xf6fbff, trim: 0x7dffb2, pants: 0xff7ad9, hair: 0xc0508a, skin: 0xffd0b5, shoe: 0xffd166, accent: 0x7dffb2 };
-    case "cookie-witch":
-      return { jacket: 0x6e4b9d, trim: 0xffd166, pants: 0x2b1a44, hair: 0xff7ad9, skin: 0xffd0b5, shoe: 0xb8ff5c, accent: 0xc7b8ff };
+function bossRenderColor(type: EnemyState["type"]): number {
+  switch (type) {
+    case "balloonClown":
+      return 0xff8ac8;
+    case "crystalReflector":
+      return 0x48f7ff;
+    case "drum":
+      return 0xffd166;
+    case "mirror":
+      return 0xc7b8ff;
+    case "zero":
+      return 0xc7b8ff;
     default:
-      return defaults[characterId];
+      return 0xffd166;
   }
 }
 

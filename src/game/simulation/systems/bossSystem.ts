@@ -50,15 +50,15 @@ export class BossSystem {
       successEffect: challenge.successEffect,
       failDamage: challenge.failDamage
     };
-    state.message = "Boss Pose Break";
+    state.message = "보스 포즈 브레이크";
     this.context.pushFx({ kind: "sound", sound: "boss-break-start" });
     this.context.pushFx({ kind: "shake", intensity: 0.01, duration: 170 });
     this.context.pushFx({
       kind: "float-text",
       x: enemy.x,
       y: enemy.y - 104,
-      text: "POSE BREAK",
-      color: challenge.bossType === "drum" ? 0xffd166 : challenge.bossType === "mirror" ? 0x48f7ff : 0xc7b8ff
+      text: "보스 포즈",
+      color: bossChallengeColor(challenge.bossType)
     });
     return true;
   }
@@ -66,7 +66,13 @@ export class BossSystem {
   succeedBossChallenge(challenge: BossChallengeState, grade: Exclude<CastGrade, "Miss">): CastResponse {
     const state = this.context.getState();
     let line = "";
-    if (challenge.successEffect === "drum-counter" || challenge.successEffect === "drum-combo-counter") {
+    if (challenge.successEffect === "balloon-deflate") {
+      const popped = this.resolveBalloonChallenge(grade);
+      line = grade === "Perfect" ? `퍼펙트 압축! 분열체 ${popped}개 폭발` : `풍선 광대가 쭈그러졌어요! ${popped}개 제거`;
+    } else if (challenge.successEffect === "crystal-reveal") {
+      const cleared = this.resolveCrystalChallenge(grade);
+      line = grade === "Perfect" ? `퍼펙트 노출! 굴절탄 ${cleared}발 제거` : `크리스탈 본체 노출! ${cleared}발 제거`;
+    } else if (challenge.successEffect === "drum-counter" || challenge.successEffect === "drum-combo-counter") {
       const reflected = this.resolveDrumChallenge(grade);
       if (challenge.successEffect === "drum-combo-counter") {
         const boss = this.findBoss("drum");
@@ -75,9 +81,9 @@ export class BossSystem {
           this.context.damageEnemy(boss, grade === "Perfect" ? 240 : grade === "Great" ? 180 : 132, 0xffd166, { bypassFrontGuard: true });
           this.context.pushFx({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 390 : 300, color: 0xffd166, grade });
         }
-        line = grade === "Perfect" ? `더블 포즈 반격 Perfect! ${reflected}발 역반사` : `더블 포즈 반격 성공! ${reflected}발 역반사`;
+        line = grade === "Perfect" ? `더블 포즈 퍼펙트! ${reflected}발 역반사` : `더블 포즈 반격! ${reflected}발 역반사`;
       } else {
-        line = grade === "Perfect" ? `리듬 반사 Perfect! ${reflected}발 역반사` : `리듬 반사 성공! ${reflected}발 역반사`;
+        line = grade === "Perfect" ? `리듬 반사 퍼펙트! ${reflected}발 역반사` : `리듬 반사! ${reflected}발 역반사`;
       }
     } else if (challenge.successEffect === "mirror-shatter" || challenge.successEffect === "mirror-prison-break") {
       const shattered = this.resolveMirrorChallenge(grade);
@@ -98,7 +104,7 @@ export class BossSystem {
       line =
         challenge.successEffect === "zero-final-release"
           ? grade === "Perfect"
-            ? "최종 포즈 브레이크 Perfect! 제로 코어 붕괴"
+            ? "최종 포즈 브레이크 퍼펙트! 제로 코어 붕괴"
             : "최종 포즈 브레이크 성공! 제로 코어 해방"
           : grade === "Perfect"
             ? "제로 모션 해방! 잠시 무한 게이지"
@@ -110,13 +116,13 @@ export class BossSystem {
       kind: "float-text",
       x: state.player.x,
       y: state.player.y - 96,
-      text: grade === "Perfect" ? "PERFECT COUNTER" : "COUNTER",
+      text: grade === "Perfect" ? "퍼펙트 카운터" : "카운터",
       color: grade === "Perfect" ? 0xffd166 : 0x48f7ff
     });
     if (grade === "Perfect") {
       state.runStats.bossPosePerfectCounters += 1;
-      const counterColor = challenge.bossType === "drum" ? 0xffd166 : challenge.bossType === "mirror" ? 0x48f7ff : 0xc7b8ff;
-      this.context.pushCutIn("PERFECT COUNTER", line, counterColor, 680);
+      const counterColor = bossChallengeColor(challenge.bossType);
+      this.context.pushCutIn("퍼펙트 카운터", line, counterColor, 680);
       this.context.pushFx({ kind: "shake", intensity: 0.014, duration: 160 });
     }
     this.context.pushFx({ kind: "sound", sound: "boss-break-success", grade });
@@ -133,37 +139,46 @@ export class BossSystem {
     player.invulnerableTime = 0;
     player.hurtCooldown = 0;
 
-    if (challenge.bossType === "mirror") {
+    if (challenge.bossType === "balloonClown") {
+      this.context.damagePlayer(challenge.failDamage);
+      player.movementSlowTime = Math.max(player.movementSlowTime, 1.2);
+      state.message = "파티 폭탄을 피하지 못했어요.";
+    } else if (challenge.bossType === "crystalReflector") {
+      this.context.damagePlayer(challenge.failDamage);
+      player.controlReverseTime = Math.max(player.controlReverseTime, 1.8);
+      player.movementSlowTime = Math.max(player.movementSlowTime, 1);
+      state.message = "굴절 충격! 방향이 흔들려요.";
+    } else if (challenge.bossType === "mirror") {
       player.controlReverseTime = Math.max(player.controlReverseTime, 3.2);
       player.movementSlowTime = Math.max(player.movementSlowTime, 1.8);
       if (challenge.failDamage > 0) {
         this.context.damagePlayer(challenge.failDamage);
       }
-      state.message = "거울 반전: 이동이 뒤틀립니다";
+      state.message = "거울 반전! 이동이 뒤틀려요.";
     } else if (challenge.bossType === "zero") {
       player.gauge = 0;
       this.context.damagePlayer(challenge.failDamage);
-      state.message = "제로 모션: 코어 게이지가 비었습니다";
+      state.message = "제로 모션! 코어 게이지가 비었어요.";
       const boss = this.findBoss(challenge.bossType);
       if (boss) {
         this.context.fireZeroMotionPulse(boss);
       }
     } else {
       this.context.damagePlayer(challenge.failDamage);
-      state.message = "드럼 비트에 밀려났습니다";
+      state.message = "드럼 비트에 밀려났어요.";
     }
 
     if (this.context.currentTutorialStepIs("boss-pose-break")) {
       state.player.hp = Math.max(state.player.hp, 35);
       this.context.startTutorialBossPoseBreak();
-      state.message = "다시 크로스 가드를 시도하세요";
+      state.message = "다시 크로스 가드를 해봐요.";
     }
 
     this.context.pushFx({
       kind: "float-text",
       x: player.x,
       y: player.y - 92,
-      text: "BREAK FAIL",
+      text: "브레이크 실패",
       color: 0xff5ea8
     });
     this.context.pushFx({ kind: "sound", sound: "boss-break-fail" });
@@ -240,6 +255,60 @@ export class BossSystem {
     return clones.length;
   }
 
+  resolveBalloonChallenge(grade: Exclude<CastGrade, "Miss">): number {
+    const state = this.context.getState();
+    const boss = this.findBoss("balloonClown");
+    const origin = boss ?? state.player;
+    const limit = grade === "Perfect" ? 8 : grade === "Great" ? 5 : 3;
+    const adds = [...state.enemies]
+      .filter((enemy) => enemy.type === "bombNoise" || enemy.type === "swarm")
+      .map((enemy) => ({ enemy, range: distance(enemy, origin) }))
+      .filter((item) => item.range < 620)
+      .sort((a, b) => a.range - b.range)
+      .slice(0, limit);
+
+    for (const { enemy } of adds) {
+      this.context.damageEnemy(enemy, enemy.hp + 18, 0xff8ac8, { bypassFrontGuard: true });
+    }
+
+    if (boss) {
+      boss.slowTime = Math.max(boss.slowTime, grade === "Perfect" ? 5.2 : grade === "Great" ? 3.8 : 2.5);
+      boss.pulseCooldown = Math.max(boss.pulseCooldown, grade === "Perfect" ? 6.4 : 4.8);
+      boss.shootCooldown = Math.max(boss.shootCooldown, 2.2);
+      this.context.damageEnemy(boss, grade === "Perfect" ? 210 : grade === "Great" ? 150 : 98, 0xff8ac8, { bypassFrontGuard: true });
+      this.context.pushFx({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 340 : 240, color: 0xff8ac8, grade });
+      this.context.pushFx({ kind: "shake", intensity: grade === "Perfect" ? 0.018 : 0.012, duration: 210 });
+    }
+
+    return adds.length;
+  }
+
+  resolveCrystalChallenge(grade: Exclude<CastGrade, "Miss">): number {
+    const state = this.context.getState();
+    const boss = this.findBoss("crystalReflector");
+    const origin = boss ?? state.player;
+    let cleared = 0;
+
+    state.projectiles = state.projectiles.filter((projectile) => {
+      if (projectile.owner !== "enemy" || distance(projectile, origin) > (grade === "Perfect" ? 720 : 520)) {
+        return true;
+      }
+      cleared += 1;
+      return false;
+    });
+
+    if (boss) {
+      boss.markedTime = Math.max(boss.markedTime, grade === "Perfect" ? 6 : grade === "Great" ? 4.5 : 3.2);
+      boss.slowTime = Math.max(boss.slowTime, grade === "Perfect" ? 4.2 : 2.8);
+      boss.pulseCooldown = Math.max(boss.pulseCooldown, 4.8);
+      this.context.damageEnemy(boss, grade === "Perfect" ? 220 : grade === "Great" ? 158 : 104, 0x48f7ff, { bypassFrontGuard: true });
+      this.context.pushFx({ kind: "burst", x: boss.x, y: boss.y, radius: grade === "Perfect" ? 330 : 230, color: 0x48f7ff, grade });
+      this.context.pushFx({ kind: "shake", intensity: grade === "Perfect" ? 0.018 : 0.011, duration: 190 });
+    }
+
+    return cleared;
+  }
+
   resolveZeroChallenge(grade: Exclude<CastGrade, "Miss">, finalBreak = false): void {
     const state = this.context.getState();
     const player = state.player;
@@ -267,4 +336,20 @@ export class BossSystem {
 
 export function getCurrentBossChallengeGesture(challenge: BossChallengeState): BossChallengeState["requiredGesture"] {
   return challenge.sequence[challenge.currentIndex] ?? challenge.requiredGesture;
+}
+
+function bossChallengeColor(type: BossChallengeState["bossType"]): number {
+  switch (type) {
+    case "balloonClown":
+      return 0xff8ac8;
+    case "crystalReflector":
+      return 0x48f7ff;
+    case "drum":
+      return 0xffd166;
+    case "mirror":
+      return 0xc7b8ff;
+    case "zero":
+    default:
+      return 0xc7b8ff;
+  }
 }

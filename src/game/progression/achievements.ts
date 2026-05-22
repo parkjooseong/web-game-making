@@ -25,14 +25,14 @@ export interface AchievementDefinition {
   getCurrent: (snapshot: ProgressSnapshot) => number;
 }
 
-const BOSS_TOTAL = 3;
+const BOSS_TOTAL = 5;
 const CORE_TOTAL = 6;
 
 export const ACHIEVEMENTS: AchievementDefinition[] = [
   {
     id: "perfect-cast-10",
     title: "자세가 살아있네",
-    description: "Perfect Cast를 총 10회 성공합니다.",
+    description: "퍼펙트 캐스트를 총 10회 성공합니다.",
     category: "캐스팅",
     target: 10,
     getCurrent: totalPerfectCasts
@@ -40,7 +40,7 @@ export const ACHIEVEMENTS: AchievementDefinition[] = [
   {
     id: "perfect-cast-100",
     title: "퍼펙트 캐스터",
-    description: "Perfect Cast를 총 100회 성공합니다.",
+    description: "퍼펙트 캐스트를 총 100회 성공합니다.",
     category: "캐스팅",
     target: 100,
     rewardDescription: "네온 팝 이펙트 팔레트 해금 조건",
@@ -49,7 +49,7 @@ export const ACHIEVEMENTS: AchievementDefinition[] = [
   {
     id: "no-miss-stage-clear",
     title: "흔들림 없는 주문",
-    description: "Miss 없이 스테이지를 클리어합니다.",
+    description: "미스 없이 스테이지를 클리어합니다.",
     category: "클리어",
     target: 1,
     getCurrent: (snapshot) => snapshot.achievementStats.noMissStageClears
@@ -57,7 +57,7 @@ export const ACHIEVEMENTS: AchievementDefinition[] = [
   {
     id: "boss-pose-perfect",
     title: "보스 포즈 브레이커",
-    description: "보스 포즈 브레이크를 Perfect로 카운터합니다.",
+    description: "보스 포즈 브레이크를 퍼펙트로 카운터합니다.",
     category: "보스",
     target: 1,
     getCurrent: (snapshot) => snapshot.achievementStats.bossPosePerfectCounters
@@ -109,7 +109,7 @@ export const ACHIEVEMENTS: AchievementDefinition[] = [
   {
     id: "all-bosses",
     title: "루프시티 보스 정화",
-    description: "드럼, 미러, 제로 보스를 모두 처치합니다.",
+    description: "드럼, 풍선 광대, 크리스탈 리플렉터, 미러, 제로 보스를 모두 처치합니다.",
     category: "보스",
     target: BOSS_TOTAL,
     rewardDescription: "골드 러시 이펙트 팔레트 해금 조건",

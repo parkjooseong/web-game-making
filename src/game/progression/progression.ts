@@ -1,4 +1,6 @@
 import { ADVENTURE_STAGES } from "../content/adventure";
+import { isDifficulty } from "../content/difficulty";
+import { isPoseAssistLevel } from "../content/poseAssist";
 import { CHARACTER_ORDER, getSkillsForCharacter } from "../content/skills";
 import type {
   AchievementId,
@@ -8,9 +10,11 @@ import type {
   CharacterId,
   CharacterSkinId,
   CoreId,
+  Difficulty,
   EffectPaletteId,
   EnemyType,
   GameMode,
+  PoseAssistLevel,
   UnlockedItem
 } from "../simulation/types";
 import {
@@ -19,6 +23,14 @@ import {
   getAchievementProgress,
   type AchievementProgress
 } from "./achievements";
+import {
+  createDefaultCharacterQuestProgress,
+  normalizeCharacterQuestProgress,
+  updateCharacterQuestObjective,
+  type CharacterQuestObjectiveMode,
+  type CharacterQuestProgress,
+  type CharacterQuestUnlock
+} from "./characterQuests";
 import { UNLOCK_CONDITIONS, isUnlockConditionMet } from "./unlocks";
 
 export interface CoreDefinition {
@@ -122,12 +134,19 @@ export interface RunSummary {
   levelAfter: number;
   unlockedItems: UnlockedItem[];
   unlockedAchievements: AchievementUnlock[];
+  characterQuestUnlocks: CharacterQuestUnlock[];
+}
+
+export interface CastProgressResult {
+  unlockedAchievements: AchievementUnlock[];
+  characterQuestUnlocks: CharacterQuestUnlock[];
 }
 
 export interface AdventureStageClearResult extends AdventureStageProgress {
   grade: AdventureGrade;
   isNewBest: boolean;
   unlockedAchievements: AchievementUnlock[];
+  characterQuestUnlocks: CharacterQuestUnlock[];
 }
 
 export interface UnlockStats {
@@ -149,9 +168,12 @@ export interface AchievementStats {
 
 export interface ProgressSnapshot {
   tutorialCompleted: boolean;
+  selectedDifficulty: Difficulty;
+  selectedPoseAssistLevel: PoseAssistLevel;
   unlockStats: UnlockStats;
   achievementStats: AchievementStats;
   achievements: Record<AchievementId, AchievementProgress>;
+  characterQuestProgress: CharacterQuestProgress;
   characters: Record<CharacterId, CharacterProgress>;
   skills: Record<string, SkillProgress>;
   unlockedCoreIds: CoreId[];
@@ -177,13 +199,13 @@ export const CORES: CoreDefinition[] = [
     id: "echo-core",
     title: "에코 코어",
     shortLabel: "ECHO",
-    description: "스킬이 낮은 확률로 Normal 등급 잔향을 한 번 더 발동합니다."
+    description: "스킬이 낮은 확률로 노멀 등급 잔향을 한 번 더 발동합니다."
   },
   {
     id: "rhythm-core",
     title: "리듬 코어",
     shortLabel: "RHYTHM",
-    description: "Perfect Cast 때 코어 게이지와 기본 공격 템포를 추가로 얻습니다."
+    description: "퍼펙트 캐스트 때 코어 게이지와 기본 공격 템포를 추가로 얻습니다."
   },
   {
     id: "guard-core",
@@ -333,7 +355,7 @@ export const EFFECT_PALETTES: EffectPaletteDefinition[] = [
     id: "gold-rush",
     title: "골드 러시",
     shortLabel: "GOLD",
-    description: "Perfect Cast 연출이 금빛으로 번지는 화려한 이펙트 스킨입니다.",
+    description: "퍼펙트 캐스트 연출이 금빛으로 번지는 화려한 이펙트 스킨입니다.",
     primary: 0xffd166,
     secondary: 0xd7ff3f,
     uiColor: "#ffd166"
@@ -362,7 +384,7 @@ export const STORY_ENTRIES: StoryEntry[] = [
     characterId: "rio",
     title: "번개보다 빠른 책임감",
     requiredLevel: 3,
-    body: "건방진 말투 뒤에는 늦지 않겠다는 약속이 있습니다. Perfect Cast가 쌓일수록 리오는 더 과감해집니다."
+    body: "건방진 말투 뒤에는 늦지 않겠다는 약속이 있습니다. 퍼펙트 캐스트가 쌓일수록 리오는 더 과감해집니다."
   },
   {
     id: "maru-1",
@@ -428,7 +450,7 @@ export const NOISE_CODEX: NoiseCodexEntry[] = [
     title: "노이즈 스웜",
     role: "군집 압박",
     weakness: "광역기, 장판",
-    description: "작고 많이 몰려옵니다. Perfect Cast 광역 이펙트의 손맛을 확인하기 좋은 표적입니다."
+    description: "작고 많이 몰려옵니다. 퍼펙트 캐스트 광역 이펙트의 손맛을 확인하기 좋은 표적입니다."
   },
   {
     enemyType: "tank",
@@ -473,6 +495,20 @@ export const NOISE_CODEX: NoiseCodexEntry[] = [
     description: "가까워지거나 처치될 때 폭발합니다. 무리를 향해 터뜨리면 위험이 기회로 바뀝니다."
   },
   {
+    enemyType: "balloonClown",
+    title: "풍선 광대",
+    role: "놀이공원 중간 보스",
+    weakness: "서클 포즈 브레이크, 폭발 예고 회피",
+    description: "고무처럼 튀어 오르며 파티 폭탄을 흩뿌립니다. 서클 포즈를 성공시키면 풍선이 쭈그러들어 긴 빈틈이 생깁니다."
+  },
+  {
+    enemyType: "crystalReflector",
+    title: "크리스탈 리플렉터",
+    role: "미러 타워 중간 보스",
+    weakness: "측후방 공격, 포커스 트라이앵글",
+    description: "정면 공격을 반사하고 거울 레이저로 공간을 가릅니다. 포커스 트라이앵글로 본체를 드러내면 반사막이 약해집니다."
+  },
+  {
     enemyType: "drum",
     title: "드럼 노이즈",
     role: "1지역 보스",
@@ -490,7 +526,7 @@ export const NOISE_CODEX: NoiseCodexEntry[] = [
     enemyType: "zero",
     title: "제로 모션",
     role: "최종 보스",
-    weakness: "게이지 관리, Perfect Cast",
+    weakness: "게이지 관리, 퍼펙트 캐스트",
     description: "움직임과 코어 게이지를 빼앗습니다. 지금까지 익힌 동작을 종합해 반격해야 합니다."
   }
 ];
@@ -534,7 +570,7 @@ const DAILY_POOL: DailyChallengeSeed[] = [
   {
     id: "perfect-surge",
     title: "퍼펙트 서지",
-    description: "Perfect Cast가 더 강해지고 코어 게이지를 추가로 회복합니다.",
+    description: "퍼펙트 캐스트가 더 강해지고 코어 게이지를 추가로 회복합니다.",
     modifiers: {
       perfectDamageMultiplier: 1.12,
       perfectGaugeGain: 12
@@ -562,7 +598,7 @@ const DAILY_POOL: DailyChallengeSeed[] = [
   {
     id: "pose-master",
     title: "포즈 마스터",
-    description: "Perfect Cast 피해가 크게 증가하지만 Miss 쿨타임 패널티도 커집니다.",
+    description: "퍼펙트 캐스트 피해가 크게 증가하지만 미스 쿨타임 패널티도 커집니다.",
     modifiers: {
       perfectDamageMultiplier: 1.35,
       missCooldownMultiplier: 1.45,
@@ -673,6 +709,22 @@ export class ProgressionStore {
     return CORES.find((core) => core.id === this.snapshot.equippedCoreId) ?? CORES[0];
   }
 
+  setDifficulty(difficulty: Difficulty): void {
+    if (!isDifficulty(difficulty) || this.snapshot.selectedDifficulty === difficulty) {
+      return;
+    }
+    this.snapshot.selectedDifficulty = difficulty;
+    this.save();
+  }
+
+  setPoseAssistLevel(level: PoseAssistLevel): void {
+    if (!isPoseAssistLevel(level) || this.snapshot.selectedPoseAssistLevel === level) {
+      return;
+    }
+    this.snapshot.selectedPoseAssistLevel = level;
+    this.save();
+  }
+
   equipCore(coreId: CoreId): void {
     if (!this.snapshot.unlockedCoreIds.includes(coreId)) {
       return;
@@ -745,8 +797,16 @@ export class ProgressionStore {
     return true;
   }
 
-  recordAdventureStageClear(input: { stageId: string; score: number; seconds: number; hpRatio: number; misses?: number }): AdventureStageClearResult {
+  recordAdventureStageClear(input: {
+    stageId: string;
+    score: number;
+    seconds: number;
+    hpRatio: number;
+    misses?: number;
+    characterId?: CharacterId;
+  }): AdventureStageClearResult {
     const current = this.snapshot.adventureStages[input.stageId] ?? createDefaultAdventureStageProgress();
+    const characterQuestUnlocks: CharacterQuestUnlock[] = [];
     const grade = calculateAdventureGrade(input.score, input.seconds, input.hpRatio);
     const currentRank = gradeRank(current.bestGrade);
     const nextRank = gradeRank(grade);
@@ -772,24 +832,45 @@ export class ProgressionStore {
     if ((input.misses ?? 0) === 0) {
       this.snapshot.achievementStats.noMissStageClears += 1;
     }
+    if (input.characterId === "rio" && input.seconds <= 300) {
+      characterQuestUnlocks.push(...this.recordCharacterQuestProgressInternal("rio", "rio-fast-clear", 1, "complete"));
+    }
     this.evaluateProgression();
     this.save();
-    return { ...nextProgress, grade, isNewBest, unlockedAchievements: this.drainUnlockedAchievements() };
+    return { ...nextProgress, grade, isNewBest, unlockedAchievements: this.drainUnlockedAchievements(), characterQuestUnlocks };
   }
 
-  recordCast(characterId: CharacterId, skillId: string, grade: CastGrade): AchievementUnlock[] {
+  recordCast(characterId: CharacterId, skillId: string, grade: CastGrade): CastProgressResult {
     const character = this.snapshot.characters[characterId];
     const skill = this.snapshot.skills[skillId] ?? { uses: 0, perfects: 0, level: 1 };
+    const characterQuestUnlocks: CharacterQuestUnlock[] = [];
     skill.uses += 1;
     if (grade === "Perfect") {
       skill.perfects += 1;
       character.perfectCasts += 1;
+      if (characterId === "maru" && skillId === "dokkaebi-guard") {
+        characterQuestUnlocks.push(...this.recordCharacterQuestProgressInternal("maru", "maru-guard-perfects", 1, "add"));
+      }
     }
     skill.level = calculateSkillLevel(skill.uses, skill.perfects);
     this.snapshot.skills[skillId] = skill;
     this.evaluateProgression();
     this.save();
-    return this.drainUnlockedAchievements();
+    return {
+      unlockedAchievements: this.drainUnlockedAchievements(),
+      characterQuestUnlocks
+    };
+  }
+
+  recordCharacterQuestProgress(
+    characterId: CharacterId,
+    objectiveId: string,
+    amount = 1,
+    mode: CharacterQuestObjectiveMode = "add"
+  ): CharacterQuestUnlock[] {
+    const unlocks = this.recordCharacterQuestProgressInternal(characterId, objectiveId, amount, mode);
+    this.save();
+    return unlocks;
   }
 
   recordRun(input: {
@@ -805,10 +886,12 @@ export class ProgressionStore {
     shieldDamageAbsorbed?: number;
     markedEnemyKills?: number;
     slimesSummoned?: number;
+    maxSlimesMaintained?: number;
     bossesDefeated?: BossType[];
   }): RunSummary {
     const character = this.snapshot.characters[input.characterId];
     const levelBefore = character.level;
+    const characterQuestUnlocks: CharacterQuestUnlock[] = [];
     const modeBonus =
       input.mode === "tutorial"
         ? 20
@@ -838,20 +921,33 @@ export class ProgressionStore {
       }
       if (input.characterId === "rio" && input.seconds <= 300) {
         this.snapshot.achievementStats.rioFastClears += 1;
+        characterQuestUnlocks.push(...this.recordCharacterQuestProgressInternal("rio", "rio-fast-clear", 1, "complete"));
       }
       if (input.mode === "survival" && input.seconds >= 600) {
         this.snapshot.achievementStats.survivalTenMinuteClears += 1;
+      }
+      if (input.characterId === "maru" && input.bossClear && input.hpRatio <= 0.3) {
+        characterQuestUnlocks.push(...this.recordCharacterQuestProgressInternal("maru", "maru-low-hp-boss-clear", 1, "complete"));
       }
     }
     this.snapshot.achievementStats.bossPosePerfectCounters += input.bossPosePerfectCounters ?? 0;
     if (input.characterId === "maru") {
       this.snapshot.achievementStats.maruShieldDamageAbsorbed += Math.max(0, Math.round(input.shieldDamageAbsorbed ?? 0));
+      characterQuestUnlocks.push(
+        ...this.recordCharacterQuestProgressInternal("maru", "maru-shield-absorb", Math.max(0, Math.round(input.shieldDamageAbsorbed ?? 0)), "add")
+      );
     }
     if (input.characterId === "neon") {
       this.snapshot.achievementStats.neonMarkedKills += Math.max(0, Math.round(input.markedEnemyKills ?? 0));
+      characterQuestUnlocks.push(
+        ...this.recordCharacterQuestProgressInternal("neon", "neon-marked-kills", Math.max(0, Math.round(input.markedEnemyKills ?? 0)), "add")
+      );
     }
     if (input.characterId === "cookie") {
       this.snapshot.achievementStats.cookieSlimesSummoned += Math.max(0, Math.round(input.slimesSummoned ?? 0));
+      characterQuestUnlocks.push(
+        ...this.recordCharacterQuestProgressInternal("cookie", "cookie-seven-slimes-run", Math.max(0, Math.round(input.maxSlimesMaintained ?? 0)), "max")
+      );
     }
     this.snapshot.achievementStats.defeatedBossTypes = Array.from(
       new Set([...this.snapshot.achievementStats.defeatedBossTypes, ...(input.bossesDefeated ?? [])])
@@ -864,7 +960,8 @@ export class ProgressionStore {
       levelBefore,
       levelAfter: character.level,
       unlockedItems: this.drainUnlockedItems(),
-      unlockedAchievements: this.drainUnlockedAchievements()
+      unlockedAchievements: this.drainUnlockedAchievements(),
+      characterQuestUnlocks
     };
   }
 
@@ -874,6 +971,15 @@ export class ProgressionStore {
     }
     this.snapshot.tutorialCompleted = true;
     this.save();
+  }
+
+  private recordCharacterQuestProgressInternal(
+    characterId: CharacterId,
+    objectiveId: string,
+    amount: number,
+    mode: CharacterQuestObjectiveMode
+  ): CharacterQuestUnlock[] {
+    return updateCharacterQuestObjective(this.snapshot.characterQuestProgress, characterId, objectiveId, amount, mode);
   }
 
   evaluateProgression(context: Partial<{ characterId: CharacterId; mode: GameMode; victory: boolean; hpRatio: number; bossClear: boolean }> = {}): void {
@@ -1056,6 +1162,8 @@ function createDefaultSnapshot(): ProgressSnapshot {
 
   return {
     tutorialCompleted: false,
+    selectedDifficulty: "normal",
+    selectedPoseAssistLevel: "normal",
     unlockStats: {
       storyVictories: 0,
       maruBossClears: 0,
@@ -1063,6 +1171,7 @@ function createDefaultSnapshot(): ProgressSnapshot {
     },
     achievementStats: createDefaultAchievementStats(),
     achievements: createDefaultAchievementProgress(),
+    characterQuestProgress: createDefaultCharacterQuestProgress(),
     characters,
     skills,
     unlockedCoreIds: [...defaultUnlockedCoreIds],
@@ -1141,9 +1250,12 @@ function normalizeSnapshot(input: Partial<ProgressSnapshot>): ProgressSnapshot {
     ...fallback,
     ...input,
     tutorialCompleted: Boolean(input.tutorialCompleted),
+    selectedDifficulty: isDifficulty(input.selectedDifficulty) ? input.selectedDifficulty : fallback.selectedDifficulty,
+    selectedPoseAssistLevel: isPoseAssistLevel(input.selectedPoseAssistLevel) ? input.selectedPoseAssistLevel : fallback.selectedPoseAssistLevel,
     unlockStats,
     achievementStats,
     achievements: normalizeAchievementProgress(input.achievements),
+    characterQuestProgress: normalizeCharacterQuestProgress(input.characterQuestProgress),
     characters: { ...fallback.characters, ...input.characters },
     skills: { ...fallback.skills, ...input.skills },
     unlockedCoreIds,
@@ -1208,9 +1320,13 @@ function normalizeAchievementStats(input?: Partial<AchievementStats>): Achieveme
     cookieSlimesSummoned: Math.max(0, Math.floor(input?.cookieSlimesSummoned ?? fallback.cookieSlimesSummoned)),
     survivalTenMinuteClears: Math.max(0, Math.floor(input?.survivalTenMinuteClears ?? fallback.survivalTenMinuteClears)),
     defeatedBossTypes: Array.from(
-      new Set((input?.defeatedBossTypes ?? fallback.defeatedBossTypes).filter((boss): boss is BossType => boss === "drum" || boss === "mirror" || boss === "zero"))
+      new Set((input?.defeatedBossTypes ?? fallback.defeatedBossTypes).filter(isKnownBossType))
     )
   };
+}
+
+function isKnownBossType(boss: unknown): boss is BossType {
+  return boss === "balloonClown" || boss === "crystalReflector" || boss === "drum" || boss === "mirror" || boss === "zero";
 }
 
 function normalizeAchievementProgress(input?: Partial<Record<AchievementId, Partial<AchievementProgress>>>): Record<AchievementId, AchievementProgress> {
@@ -1330,13 +1446,13 @@ export function describeDailyModifiers(modifiers: DailyChallengeModifiers): stri
     lines.push(`스킬 쿨타임 x${formatModifier(modifiers.skillCooldownMultiplier)}`);
   }
   if (modifiers.perfectDamageMultiplier !== 1) {
-    lines.push(`Perfect 스킬 피해 x${formatModifier(modifiers.perfectDamageMultiplier)}`);
+    lines.push(`퍼펙트 스킬 피해 x${formatModifier(modifiers.perfectDamageMultiplier)}`);
   }
   if (modifiers.perfectGaugeGain > 0) {
-    lines.push(`Perfect 시 게이지 +${modifiers.perfectGaugeGain}`);
+    lines.push(`퍼펙트 시 게이지 +${modifiers.perfectGaugeGain}`);
   }
   if (modifiers.missCooldownMultiplier !== 1) {
-    lines.push(`Miss 쿨타임 패널티 x${formatModifier(modifiers.missCooldownMultiplier)}`);
+    lines.push(`미스 쿨타임 패널티 x${formatModifier(modifiers.missCooldownMultiplier)}`);
   }
   if (modifiers.killGaugeMultiplier !== 1) {
     lines.push(`처치 게이지 회복 x${formatModifier(modifiers.killGaugeMultiplier)}`);
